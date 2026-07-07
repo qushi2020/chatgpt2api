@@ -5,6 +5,7 @@ from threading import Lock, Thread
 from typing import Any
 
 from fastapi import APIRouter, Header, Query
+from fastapi.concurrency import run_in_threadpool
 
 from api.support import require_identity
 from services.account_service import account_service
@@ -239,10 +240,10 @@ def create_router() -> APIRouter:
         queued = False
         throttled = False
         if mode == "sync":
-            _run_sync_refresh()
+            await run_in_threadpool(_run_sync_refresh)
         elif mode == "background":
             queued, throttled = _start_background_refresh()
         refresh_info = _refresh_snapshot(mode, queued=queued, throttled=throttled)
-        return _quota_summary(refresh_info)
+        return await run_in_threadpool(_quota_summary, refresh_info)
 
     return router
