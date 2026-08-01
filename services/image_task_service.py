@@ -69,6 +69,7 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "model": task.get("model"),
         "size": task.get("size"),
         "quality": task.get("quality"),
+        "verbatim_prompt": bool(task.get("verbatim_prompt")),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
@@ -128,6 +129,7 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        verbatim_prompt: bool = False,
         base_url: str = "",
     ) -> dict[str, Any]:
         payload = {
@@ -136,6 +138,7 @@ class ImageTaskService:
             "n": 1,
             "size": size,
             "quality": quality,
+            "verbatim_prompt": bool(verbatim_prompt),
             "response_format": "url",
             "base_url": base_url,
         }
@@ -150,9 +153,13 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        verbatim_prompt: bool = False,
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        task_type: str = "",
+        background: str = "",
+        output_background: str = "",
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -162,8 +169,14 @@ class ImageTaskService:
             "n": 1,
             "size": size,
             "quality": quality,
+            "verbatim_prompt": bool(verbatim_prompt),
             "response_format": "url",
             "base_url": base_url,
+            # 显式任务信号：task_type=background_removal 走本地抠图；
+            # 其它非空值明确表示生成式编辑，禁用 prompt 关键词兜底判定。
+            "task_type": task_type,
+            "background": background,
+            "output_background": output_background,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -213,6 +226,9 @@ class ImageTaskService:
                 if cleaned:
                     self._save_locked()
                 return _public_task(task)
+            pending = sum(1 for item in self._tasks.values() if item.get("status") in UNFINISHED_STATUSES)
+            if pending >= max(1, int(config.image_task_max_pending)):
+                raise ValueError("图片任务队列已满，请稍后重试")
             task = {
                 "id": task_id,
                 "owner_id": owner,
@@ -221,6 +237,8 @@ class ImageTaskService:
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "verbatim_prompt": bool(payload.get("verbatim_prompt")),
+                "base_url": _clean(payload.get("base_url")),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
@@ -385,6 +403,8 @@ class ImageTaskService:
                 "model": _clean(item.get("model"), "gpt-image-2"),
                 "size": _clean(item.get("size")),
                 "quality": _clean(item.get("quality"), "auto"),
+                "verbatim_prompt": bool(item.get("verbatim_prompt")),
+                "base_url": _clean(item.get("base_url")),
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
                 "created_ts": item.get("created_ts"),
@@ -415,7 +435,8 @@ class ImageTaskService:
         for task in self._tasks.values():
             if task.get("status") in UNFINISHED_STATUSES:
                 task["status"] = TASK_STATUS_ERROR
-                task["error"] = "服务已重启，未完成的图片任务已中断"
+                # 文案包含"暂时不可用/请稍后重试"，方便调用方（如 Pixora）识别为可重试错误并自动重提任务。
+                task["error"] = "服务已重启，未完成的图片任务已中断（服务暂时不可用，请稍后重试）"
                 task["updated_at"] = _now_iso()
                 changed = True
         return changed
@@ -507,16 +528,15 @@ class ImageTaskService:
                 {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
             with self._lock:
                 task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
+                task_base_url = _clean(task.get("base_url")) if task else ""
+            # 有 base_url 时按 url 落盘返回，避免把整张图的 base64 写进任务持久化文件。
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                "",
+                "url" if task_base_url else "b64_json",
+                task_base_url or "",
                 int(time.time()),
             )["data"]
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))

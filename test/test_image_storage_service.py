@@ -121,6 +121,18 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertIn(stored.rel, FakeWebDAVClient.uploaded)
         self.assertEqual(stored.url, f"https://cdn.example.test/images/{stored.rel}")
 
+    def test_save_disabled_skips_persistence_and_returns_data_url(self):
+        self.settings["save_images"] = False
+
+        stored = self.service().save(png_bytes(), "http://app.test")
+
+        self.assertEqual(stored.storage, "none")
+        self.assertEqual(stored.rel, "")
+        self.assertTrue(stored.url.startswith("data:image/png;base64,"))
+        self.assertFalse(self.images_dir.exists())
+        self.assertFalse((self.data_dir / "image_index.json").exists())
+        self.mock_config.cleanup_old_images.assert_not_called()
+
     def test_test_webdav_writes_and_deletes_probe_file(self):
         self.settings.update({
             "enabled": True,

@@ -4,6 +4,7 @@ import mimetypes
 import os
 import random
 import re
+import threading
 import time
 
 import urllib.error
@@ -22,7 +23,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import SseIdleTimeoutError, UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -33,6 +34,11 @@ class InvalidAccessTokenError(RuntimeError):
 
 
 class ImagePollTimeoutError(RuntimeError):
+    pass
+
+
+class ImageRequestAbortedError(RuntimeError):
+    """Raised when the caller (client) disconnected before generation finished."""
     pass
 
 
@@ -91,6 +97,8 @@ FILE_ID_RE = re.compile(r"\b(file[-_](?!service\b)[A-Za-z0-9_-]+)\b")
 REAL_IMAGE_FILE_ID_RE = re.compile(r"\bfile_00000000[a-f0-9]{24}\b")
 SEDIMENT_ID_RE = re.compile(r"sediment://([A-Za-z0-9_-]+)")
 IMAGE_POLL_SETTLE_SECS = 2.0
+IMAGE_BOOTSTRAP_MAX_ATTEMPTS = 3
+IMAGE_BOOTSTRAP_RETRY_BASE_SECS = 1.0
 CODEX_RESPONSES_INSTRUCTIONS = (
     "Use the image_generation tool to create exactly one image for the user's request. "
     "Return the generated image result."
@@ -167,6 +175,8 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        # 当调用方（客户端）已断开时返回 True，用于提前终止长轮询，避免僵尸线程占用并发槽。
+        self.abort_callback: Callable[[], bool] | None = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
@@ -553,12 +563,19 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            return config.web_image_model_slug
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
 
-    def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
+    def _image_headers(
+            self,
+            path: str,
+            requirements: ChatRequirements,
+            conduit_token: str = "",
+            accept: str = "*/*",
+            turn_trace_id: str = "",
+    ) -> \
             Dict[str, str]:
         """构造图片链路请求头。"""
         headers = {
@@ -570,7 +587,9 @@ class OpenAIBackendAPI:
             headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
-        if accept == "text/event-stream":
+        if turn_trace_id:
+            headers["X-Oai-Turn-Trace-Id"] = turn_trace_id
+        elif accept == "text/event-stream":
             headers["X-Oai-Turn-Trace-Id"] = new_uuid()
         return self._headers(path, headers)
 
@@ -842,31 +861,112 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
+    @staticmethod
+    def _image_asset_pointer(reference: Dict[str, Any]) -> str:
+        file_id = str(reference["file_id"])
+        scheme = "sediment" if file_id.startswith("file_") else "file-service"
+        return f"{scheme}://{file_id}"
+
+    @classmethod
+    def _image_attachment(cls, reference: Dict[str, Any]) -> Dict[str, Any]:
+        attachment = {
+            "id": reference["file_id"],
+            "size": reference["file_size"],
+            "name": reference["file_name"],
+            "mime_type": reference["mime_type"],
+            "width": reference["width"],
+            "height": reference["height"],
+            "is_big_paste": False,
+        }
+        library_file_id = str(reference.get("library_file_id") or "").strip()
+        if library_file_id:
+            attachment["source"] = "library"
+            attachment["library_file_id"] = library_file_id
+        return attachment
+
+    @classmethod
+    def _image_user_message(
+            cls,
+            prompt: str,
+            references: list[Dict[str, Any]],
+            message_id: str,
+            create_time: float,
+    ) -> Dict[str, Any]:
+        parts = [{
+            "content_type": "image_asset_pointer",
+            "asset_pointer": cls._image_asset_pointer(item),
+            "width": item["width"],
+            "height": item["height"],
+            "size_bytes": item["file_size"],
+        } for item in references]
+        parts.append(prompt)
+        content = (
+            {"content_type": "multimodal_text", "parts": parts}
+            if references
+            else {"content_type": "text", "parts": [prompt]}
+        )
+        metadata: Dict[str, Any] = {
+            "developer_mode_connector_ids": [],
+            "selected_sources": [],
+            "selected_github_repos": [],
+            "selected_all_github_repos": False,
+            "system_hints": ["picture_v2"],
+            "serialization_metadata": {"custom_symbol_offsets": []},
+        }
+        if references:
+            metadata["attachments"] = [cls._image_attachment(item) for item in references]
+        return {
+            "id": message_id,
+            "author": {"role": "user"},
+            "create_time": create_time,
+            "content": content,
+            "metadata": metadata,
+        }
+
+    def _prepare_image_conversation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            model: str,
+            references: Optional[list[Dict[str, Any]]] = None,
+            message_id: str = "",
+            parent_message_id: str = "client-created-root",
+            create_time: float = 0.0,
+            turn_trace_id: str = "",
+    ) -> str:
         """为图片生成准备 conduit token。"""
+        references = references or []
+        message_id = message_id or new_uuid()
+        create_time = create_time or time.time()
         path = "/backend-api/f/conversation/prepare"
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "parent_message_id": parent_message_id,
             "model": self._image_model_slug(model),
-            "client_prepare_state": "success",
+            "client_prepare_state": "none",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
             "system_hints": ["picture_v2"],
-            "partial_query": {
-                "id": new_uuid(),
-                "author": {"role": "user"},
-                "content": {"content_type": "text", "parts": [prompt]},
-            },
+            "partial_query": self._image_user_message(
+                prompt, references, message_id, create_time,
+            ),
             "supports_buffering": True,
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
+            "thinking_effort": config.image_thinking_effort,
         }
+        if references:
+            payload["attachment_mime_types"] = [item["mime_type"] for item in references]
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements),
+            headers=self._image_headers(
+                path,
+                requirements,
+                conduit_token="no-token",
+                turn_trace_id=turn_trace_id,
+            ),
             json=payload,
             timeout=60,
         )
@@ -902,14 +1002,40 @@ class OpenAIBackendAPI:
             if candidate_path.exists() and candidate_path.is_file():
                 file_name = candidate_path.name
         image = Image.open(BytesIO(data))
+        image.load()
         width, height = image.size
         mime_type = Image.MIME.get(image.format, "image/png")
+        preferred_extension = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }.get(mime_type, mimetypes.guess_extension(mime_type) or ".png")
+        accepted_extensions = {
+            "image/jpeg": {".jpg", ".jpeg"},
+            "image/png": {".png"},
+            "image/webp": {".webp"},
+            "image/gif": {".gif"},
+        }.get(mime_type, {preferred_extension.lower()})
+        supplied_name = Path(str(file_name or "image"))
+        if supplied_name.suffix.lower() not in accepted_extensions:
+            stem = supplied_name.stem if supplied_name.suffix else supplied_name.name
+            file_name = f"{stem or 'image'}{preferred_extension}"
         path = "/backend-api/files"
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-            json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
-                  "height": height},
+            json={
+                "file_name": file_name,
+                "file_size": len(data),
+                "use_case": "multimodal",
+                "width": width,
+                "height": height,
+                "timezone_offset_min": -480,
+                "reset_rate_limits": False,
+                "store_in_library": True,
+                "library_persistence_mode": "opportunistic",
+            },
             timeout=60,
         )
         ensure_ok(response, path)
@@ -940,6 +1066,7 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return {
             "file_id": upload_meta["file_id"],
+            "library_file_id": str(upload_meta.get("library_file_id") or ""),
             "file_name": file_name,
             "file_size": len(data),
             "mime_type": mime_type,
@@ -947,48 +1074,30 @@ class OpenAIBackendAPI:
             "height": height,
         }
 
-    def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+    def _start_image_generation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            conduit_token: str,
+            model: str,
+            references: Optional[list[Dict[str, Any]]] = None,
+            message_id: str = "",
+            parent_message_id: str = "client-created-root",
+            create_time: float = 0.0,
+            turn_trace_id: str = "",
+    ) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
-        parts = [{
-            "content_type": "image_asset_pointer",
-            "asset_pointer": f"file-service://{item['file_id']}",
-            "width": item["width"],
-            "height": item["height"],
-            "size_bytes": item["file_size"],
-        } for item in references]
-        parts.append(prompt)
-        content = {"content_type": "multimodal_text", "parts": parts} if references else {"content_type": "text",
-                                                                                          "parts": [prompt]}
-        metadata = {
-            "developer_mode_connector_ids": [],
-            "selected_github_repos": [],
-            "selected_all_github_repos": False,
-            "system_hints": ["picture_v2"],
-            "serialization_metadata": {"custom_symbol_offsets": []},
-        }
-        if references:
-            metadata["attachments"] = [{
-                "id": item["file_id"],
-                "mimeType": item["mime_type"],
-                "name": item["file_name"],
-                "size": item["file_size"],
-                "width": item["width"],
-                "height": item["height"],
-            } for item in references]
+        message_id = message_id or new_uuid()
+        create_time = create_time or time.time()
         payload = {
             "action": "next",
-            "messages": [{
-                "id": new_uuid(),
-                "author": {"role": "user"},
-                "create_time": time.time(),
-                "content": content,
-                "metadata": metadata,
-            }],
-            "parent_message_id": new_uuid(),
+            "messages": [self._image_user_message(
+                prompt, references, message_id, create_time,
+            )],
+            "parent_message_id": parent_message_id,
             "model": self._image_model_slug(model),
-            "client_prepare_state": "sent",
+            "client_prepare_state": "success",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
@@ -1006,13 +1115,18 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
                 "app_name": "chatgpt.com",
             },
-            "paragen_cot_summary_display_override": "allow",
-            "force_parallel_switch": "auto",
+            "thinking_effort": config.image_thinking_effort,
         }
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            headers=self._image_headers(
+                path,
+                requirements,
+                conduit_token,
+                "text/event-stream",
+                turn_trace_id,
+            ),
             json=payload,
             timeout=300,
             stream=True,
@@ -2176,8 +2290,22 @@ class OpenAIBackendAPI:
             time.sleep(sleep_for)
             return True
 
+        def _aborted() -> bool:
+            try:
+                return bool(self.abort_callback and self.abort_callback())
+            except Exception:
+                return False
+
         last_task_error = ""
         while _remaining() > 0:
+            # 调用方已断开：立即停止轮询，释放并发槽，不再空等剩余超时预算。
+            if _aborted():
+                logger.info({
+                    "event": "image_poll_aborted",
+                    "conversation_id": conversation_id,
+                    "attempts_made": attempt,
+                })
+                raise ImageRequestAbortedError("caller disconnected before image generation finished")
             attempt += 1
             # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
             # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
@@ -2492,6 +2620,9 @@ class OpenAIBackendAPI:
                     file_ids,
                     sediment_ids,
                 )
+            except ImageRequestAbortedError:
+                # 调用方已断开：直接向上传播，不再降级为"部分结果"继续解析。
+                raise
             except ImagePollTimeoutError as exc:
                 # 如果轮询超时且有 task error（如 moderation 拦截），抛出 ImageContentPolicyError
                 # 而非 ImagePollTimeoutError，让调用方能区分真正的超时和上游拒绝
@@ -2570,6 +2701,19 @@ class OpenAIBackendAPI:
             except Exception:
                 pass
 
+    def _close_response_later(self, response: requests.Response, reason: str) -> None:
+        def _run() -> None:
+            try:
+                response.close()
+            except Exception as exc:
+                logger.warning({
+                    "event": "response_close_failed",
+                    "reason": reason,
+                    "error": str(exc)[:200],
+                })
+
+        threading.Thread(target=_run, name=f"close-response-{reason}", daemon=True).start()
+
     def _stream_picture_conversation(
             self,
             prompt: str,
@@ -2579,32 +2723,100 @@ class OpenAIBackendAPI:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
         self._report_progress("uploading")
-        references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        references = [self._upload_image(image, f"image_{idx}") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
         self._bootstrap()
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        message_id = new_uuid()
+        parent_message_id = "client-created-root"
+        create_time = time.time()
+        turn_trace_id = new_uuid()
+        conduit_token = self._prepare_image_conversation(
+            prompt,
+            requirements,
+            model,
+            references,
+            message_id,
+            parent_message_id,
+            create_time,
+            turn_trace_id,
+        )
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response = self._start_image_generation(
+            prompt,
+            requirements,
+            conduit_token,
+            model,
+            references,
+            message_id,
+            parent_message_id,
+            create_time,
+            turn_trace_id,
+        )
         self._report_progress("generating")
+        close_in_background = False
         try:
-            yield from iter_sse_payloads(response)
+            yield from iter_sse_payloads(
+                response,
+                idle_timeout_secs=getattr(config, "image_stream_idle_timeout_secs", 75.0),
+            )
+        except SseIdleTimeoutError:
+            close_in_background = True
+            raise
         finally:
-            response.close()
+            if close_in_background:
+                self._close_response_later(response, "image_sse_idle_timeout")
+            else:
+                response.close()
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
-            self.base_url + "/",
-            headers=self._bootstrap_headers(),
-            timeout=30,
-        )
-        ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
-        if not self.pow_script_sources:
-            self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+        last_error: Exception | None = None
+        for attempt in range(1, IMAGE_BOOTSTRAP_MAX_ATTEMPTS + 1):
+            response = None
+            try:
+                response = self.session.get(
+                    self.base_url + "/",
+                    headers=self._bootstrap_headers(),
+                    timeout=30,
+                )
+                ensure_ok(response, "bootstrap")
+                self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+                if not self.pow_script_sources:
+                    self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+                return
+            except Exception as exc:
+                last_error = exc
+                status_code = exc.status_code if isinstance(exc, UpstreamHTTPError) else None
+                retryable_status = status_code in {408, 425, 429, 500, 502, 503, 504, 524}
+                network_signal = str(exc).lower()
+                retryable_network = any(signal in network_signal for signal in (
+                    "connection reset", "connection termination", "remote connection failure",
+                    "disconnect", "timed out", "timeout", "network", "temporarily unavailable",
+                ))
+                if attempt >= IMAGE_BOOTSTRAP_MAX_ATTEMPTS or not (retryable_status or retryable_network):
+                    raise
+                retry_after = exc.retry_after if isinstance(exc, UpstreamHTTPError) else None
+                delay_secs = min(10.0, float(retry_after) if retry_after is not None else IMAGE_BOOTSTRAP_RETRY_BASE_SECS * (2 ** (attempt - 1)))
+                logger.warning({
+                    "event": "image_bootstrap_retry",
+                    "attempt": attempt,
+                    "next_attempt": attempt + 1,
+                    "status_code": status_code,
+                    "delay_secs": delay_secs,
+                    "error": str(exc)[:300],
+                })
+                time.sleep(delay_secs)
+            finally:
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+        if last_error:
+            raise last_error
 
     def _get_chat_requirements(self) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""

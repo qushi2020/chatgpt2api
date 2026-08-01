@@ -7,6 +7,7 @@ export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
 
 export type ImageStorageSettings = {
+  save_images: boolean;
   enabled: boolean;
   mode: ImageStorageMode;
   webdav_url: string;
@@ -154,6 +155,8 @@ export type ThirdPartyAppsSettings = {
 export type SettingsConfig = {
   proxy: string;
   base_url?: string;
+  web_image_model_slug?: string;
+  image_thinking_effort?: string;
   global_system_prompt?: string;
   sensitive_words?: string[];
   ai_review?: {
@@ -515,6 +518,10 @@ export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
 
 export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
+}
+
+export async function fetchFreeWebImageModelSlugs() {
+  return httpRequest<{ items: string[]; source: string; error?: string }>("/api/settings/free-web-image-model-slugs");
 }
 
 export async function updateSettingsConfig(settings: SettingsConfig) {

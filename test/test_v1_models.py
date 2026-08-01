@@ -27,6 +27,7 @@ class ModelListTests(unittest.TestCase):
                 return_value=[
                     {"access_token": "token-free", "type": "free"},
                     {"access_token": "token-web-team", "type": "Team", "source_type": "web"},
+                    {"access_token": "token-web-pro", "type": "Pro", "source_type": "web"},
                     {"access_token": "token-codex-team", "type": "Team", "source_type": "codex"},
                 ],
             ),
@@ -35,6 +36,8 @@ class ModelListTests(unittest.TestCase):
 
         ids = {item["id"] for item in result["data"]}
         self.assertIn("gpt-image-2", ids)
+        for prefix in ("plus", "team", "pro"):
+            self.assertNotIn(f"{prefix}-gpt-image-2", ids)
         self.assertIn("codex-gpt-image-2", ids)
         self.assertIn("team-codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
@@ -59,6 +62,8 @@ class ModelListTests(unittest.TestCase):
 
         ids = {item["id"] for item in result["data"]}
         self.assertIn("gpt-image-2", ids)
+        for prefix in ("plus", "team", "pro"):
+            self.assertNotIn(f"{prefix}-gpt-image-2", ids)
         self.assertNotIn("codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
 

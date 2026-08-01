@@ -68,6 +68,31 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
 
+    def test_edit_task_passes_verbatim_prompt_to_image_handler(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            captured = {}
+
+            def handler(payload):
+                captured.update(payload)
+                return {"data": [{"url": "http://example.test/edit.png"}]}
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_edit(
+                OWNER,
+                client_task_id="verbatim-edit",
+                prompt="修复老照片，渲染为彩色。",
+                model="gpt-image-2",
+                size="1536x1205",
+                quality="high",
+                verbatim_prompt=True,
+                base_url="http://local.test",
+                images=[(b"image", "source.jpg", "image/jpeg")],
+            )
+
+            task = wait_for_task(service, OWNER, "verbatim-edit", "success")
+            self.assertTrue(captured["verbatim_prompt"])
+            self.assertTrue(task["verbatim_prompt"])
+
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = self.make_service(Path(tmp_dir) / "image_tasks.json")

@@ -19,9 +19,18 @@ export function ConfigCard() {
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [proxyTestResult, setProxyTestResult] = useState<ProxyTestResult | null>(null);
   const logLevelOptions = ["debug", "info", "warning", "error"];
+  const imageThinkingEffortOptions = [
+    { value: "standard", label: "标准（standard）" },
+    { value: "low", label: "低（low）" },
+    { value: "medium", label: "中（medium）" },
+    { value: "high", label: "高（high）" },
+    { value: "extended", label: "最高（extended）" },
+  ];
   const config = useSettingsStore((state) => state.config);
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
+  const freeWebImageModelSlugs = useSettingsStore((state) => state.freeWebImageModelSlugs);
+  const isLoadingFreeWebImageModelSlugs = useSettingsStore((state) => state.isLoadingFreeWebImageModelSlugs);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
@@ -36,6 +45,8 @@ export function ConfigCard() {
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
+  const setWebImageModelSlug = useSettingsStore((state) => state.setWebImageModelSlug);
+  const setImageThinkingEffort = useSettingsStore((state) => state.setImageThinkingEffort);
   const setGlobalSystemPrompt = useSettingsStore((state) => state.setGlobalSystemPrompt);
   const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
   const setAIReviewField = useSettingsStore((state) => state.setAIReviewField);
@@ -44,7 +55,12 @@ export function ConfigCard() {
   const syncImagesToWebDAV = useSettingsStore((state) => state.syncImagesToWebDAV);
   const isTestingImageStorage = useSettingsStore((state) => state.isTestingImageStorage);
   const isSyncingImageStorage = useSettingsStore((state) => state.isSyncingImageStorage);
+  const loadFreeWebImageModelSlugs = useSettingsStore((state) => state.loadFreeWebImageModelSlugs);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
+  const modelSlugOptions = Array.from(new Set([
+    String(config?.web_image_model_slug || "gpt-5-3").trim() || "gpt-5-3",
+    ...freeWebImageModelSlugs,
+  ].map((item) => String(item || "").trim()).filter(Boolean))).sort();
 
   const handleTestProxy = async () => {
     const candidate = String(config?.proxy || "").trim();
@@ -167,6 +183,52 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
           </div>
           <div className="space-y-2">
+            <label className="text-sm text-stone-700">gpt-image-2 底层模型</label>
+            <div className="flex gap-2">
+              <Select
+                value={String(config?.web_image_model_slug || "gpt-5-3")}
+                onValueChange={setWebImageModelSlug}
+              >
+                <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                  <SelectValue placeholder="选择模型" />
+                </SelectTrigger>
+                <SelectContent>
+                  {modelSlugOptions.map((model) => (
+                    <SelectItem key={model} value={model}>{model}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                variant="outline"
+                className="h-10 shrink-0 rounded-xl border-stone-200 bg-white px-3 text-stone-700"
+                onClick={() => void loadFreeWebImageModelSlugs()}
+                disabled={isLoadingFreeWebImageModelSlugs}
+                title="刷新免费账号可用模型"
+              >
+                <RefreshCw className={`size-4 ${isLoadingFreeWebImageModelSlugs ? "animate-spin" : ""}`} />
+              </Button>
+            </div>
+            <p className="text-xs text-stone-500">用于无前缀 gpt-image-2；选项来自当前免费 web 账号可用模型。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">图片推理强度</label>
+            <Select
+              value={String(config?.image_thinking_effort || "extended")}
+              onValueChange={setImageThinkingEffort}
+            >
+              <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                <SelectValue placeholder="选择推理强度" />
+              </SelectTrigger>
+              <SelectContent>
+                {imageThinkingEffortOptions.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-stone-500">用于 gpt-image-2 图片生成和图片编辑请求的 thinking_effort。</p>
+          </div>
+          <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>
             <Input
               value={String(config?.image_account_concurrency || "")}
@@ -285,6 +347,18 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">只要用户请求包含任意敏感词，就直接返回拒绝。</p>
           </div>
           <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
+            <div className="space-y-1">
+              <label className="flex items-center gap-3 text-sm text-stone-700">
+                <Checkbox
+                  checked={config?.image_storage?.save_images !== false}
+                  onCheckedChange={(checked) => setImageStorageField("save_images", Boolean(checked))}
+                />
+                保存生成的图片
+              </label>
+              <p className="pl-7 text-xs text-stone-500">
+                关闭后生成的图片不再写入本机或 WebDAV（接口仍正常返回图片内容），仅影响新生成的图片。
+              </p>
+            </div>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <label className="flex items-center gap-3 text-sm text-stone-700">
                 <Checkbox
@@ -322,13 +396,15 @@ export function ConfigCard() {
             <div className="rounded-lg border border-stone-100 bg-stone-50 px-3 py-2 text-xs text-stone-600">
               当前待保存模式：
               <span className="ml-1 font-medium text-stone-900">
-                {config?.image_storage?.enabled
-                  ? config.image_storage.mode === "both"
-                    ? "本机 + WebDAV"
-                    : config.image_storage.mode === "webdav"
-                      ? "仅 WebDAV"
-                      : "仅本机"
-                  : "仅本机"}
+                {config?.image_storage?.save_images === false
+                  ? "不保存"
+                  : config?.image_storage?.enabled
+                    ? config.image_storage.mode === "both"
+                      ? "本机 + WebDAV"
+                      : config.image_storage.mode === "webdav"
+                        ? "仅 WebDAV"
+                        : "仅本机"
+                    : "仅本机"}
               </span>
               <span className="ml-2 text-stone-400">修改后需要点保存，或通过测试/同步按钮自动保存。</span>
             </div>

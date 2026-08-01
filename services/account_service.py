@@ -926,6 +926,11 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
+        # 所有账号并发槽位占满时不能无限等待：任务线程会卡死在 getting_account，
+        # 调用方（如 Pixora）只能靠停滞检测判死。这里加总超时并抛出带"超时/稍后重试"
+        # 字样的错误，让调用方能识别为可重试错误。
+        wait_timeout = float(config.image_slot_wait_timeout_secs)
+        deadline = time.monotonic() + wait_timeout if wait_timeout > 0 else None
         with self._image_slot_condition:
             while True:
                 if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
@@ -939,6 +944,8 @@ class AccountService:
                     self._index += 1
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RuntimeError("等待可用生图账号槽位超时，号池并发已满，请稍后重试")
                 self._image_slot_condition.wait(timeout=1.0)
 
     def release_image_slot(self, access_token: str) -> None:

@@ -10,6 +10,7 @@ import {
   fetchCPAPoolFiles,
   fetchCPAPools,
   fetchBackups,
+  fetchFreeWebImageModelSlugs,
   fetchSettingsConfig,
   runBackupNow,
   syncImageStorage,
@@ -125,6 +126,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
   const imageStorage = typeof config.image_storage === "object" && config.image_storage
     ? config.image_storage as ImageStorageSettings
     : {
+      save_images: true,
       enabled: false,
       mode: "local",
       webdav_url: "",
@@ -180,6 +182,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     base_url: typeof config.base_url === "string" ? config.base_url : "",
+    web_image_model_slug: String(config.web_image_model_slug || "gpt-5-3"),
+    image_thinking_effort: String(config.image_thinking_effort || "extended"),
     global_system_prompt: String(config.global_system_prompt || ""),
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
     ai_review: {
@@ -190,6 +194,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       prompt: String(config.ai_review?.prompt || ""),
     },
     image_storage: {
+      save_images: imageStorage.save_images !== false,
       enabled: Boolean(imageStorage.enabled),
       mode: imageStorageMode,
       webdav_url: String(imageStorage.webdav_url || ""),
@@ -255,6 +260,8 @@ type SettingsStore = {
   isTestingBackup: boolean;
   isTestingImageStorage: boolean;
   isSyncingImageStorage: boolean;
+  freeWebImageModelSlugs: string[];
+  isLoadingFreeWebImageModelSlugs: boolean;
 
   pools: CPAPool[];
   isLoadingPools: boolean;
@@ -280,6 +287,7 @@ type SettingsStore = {
 
   initialize: () => Promise<void>;
   loadConfig: () => Promise<void>;
+  loadFreeWebImageModelSlugs: () => Promise<void>;
   saveConfig: () => Promise<boolean>;
   loadBackups: (silent?: boolean) => Promise<void>;
   runBackup: () => Promise<void>;
@@ -300,6 +308,8 @@ type SettingsStore = {
   setLogLevel: (level: string, enabled: boolean) => void;
   setProxy: (value: string) => void;
   setBaseUrl: (value: string) => void;
+  setWebImageModelSlug: (value: string) => void;
+  setImageThinkingEffort: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
   setSensitiveWordsText: (value: string) => void;
   setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
@@ -346,6 +356,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isTestingBackup: false,
   isTestingImageStorage: false,
   isSyncingImageStorage: false,
+  freeWebImageModelSlugs: ["gpt-5-3"],
+  isLoadingFreeWebImageModelSlugs: false,
 
   pools: [],
   isLoadingPools: true,
@@ -370,7 +382,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isStartingImport: false,
 
   initialize: async () => {
-    await Promise.allSettled([get().loadConfig(), get().loadPools()]);
+    await Promise.allSettled([get().loadConfig(), get().loadPools(), get().loadFreeWebImageModelSlugs()]);
     const backup = get().config?.backup;
     const isConfigured = Boolean(
       String(backup?.account_id || "").trim()
@@ -400,6 +412,22 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     }
   },
 
+  loadFreeWebImageModelSlugs: async () => {
+    set({ isLoadingFreeWebImageModelSlugs: true });
+    try {
+      const data = await fetchFreeWebImageModelSlugs();
+      const items = Array.from(new Set((Array.isArray(data.items) ? data.items : [])
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)));
+      set({ freeWebImageModelSlugs: items.length > 0 ? items : ["gpt-5-3"] });
+    } catch (error) {
+      set({ freeWebImageModelSlugs: ["gpt-5-3"] });
+      toast.error(error instanceof Error ? error.message : "加载免费账号模型列表失败");
+    } finally {
+      set({ isLoadingFreeWebImageModelSlugs: false });
+    }
+  },
+
   saveConfig: async () => {
     const { config } = get();
     if (!config) {
@@ -424,6 +452,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
         proxy: config.proxy.trim(),
         base_url: String(config.base_url || "").trim(),
+        web_image_model_slug: String(config.web_image_model_slug || "gpt-5-3").trim() || "gpt-5-3",
+        image_thinking_effort: String(config.image_thinking_effort || "extended").trim() || "extended",
         global_system_prompt: String(config.global_system_prompt || "").trim(),
         sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
         ai_review: {
@@ -434,6 +464,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           prompt: String(config.ai_review?.prompt || "").trim(),
         },
         image_storage: {
+          save_images: config.image_storage?.save_images !== false,
           enabled: Boolean(config.image_storage?.enabled),
           mode: config.image_storage?.enabled && ["webdav", "both"].includes(String(config.image_storage?.mode)) ? config.image_storage.mode : "local",
           webdav_url: String(config.image_storage?.webdav_url || "").trim(),
@@ -588,6 +619,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         },
       };
     });
+  },
+
+  setWebImageModelSlug: (value) => {
+    set((state) => state.config ? { config: { ...state.config, web_image_model_slug: value } } : {});
+  },
+
+  setImageThinkingEffort: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_thinking_effort: value } } : {});
   },
 
   setGlobalSystemPrompt: (value) => {

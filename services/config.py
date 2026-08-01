@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 import json
 import os
+import re
 import sys
 from pathlib import Path
 import time
@@ -15,6 +16,10 @@ DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+WEB_IMAGE_DEFAULT_MODEL_SLUG = "gpt-5-3"
+MODEL_SLUG_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+IMAGE_THINKING_EFFORT_DEFAULT = "extended"
+IMAGE_THINKING_EFFORT_OPTIONS = {"standard", "low", "medium", "high", "extended"}
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -28,6 +33,7 @@ DEFAULT_BACKUP_INCLUDE = {
 }
 
 DEFAULT_IMAGE_STORAGE = {
+    "save_images": True,
     "enabled": False,
     "mode": "local",
     "webdav_url": "",
@@ -151,6 +157,7 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         mode = "local"
     root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
     return {
+        "save_images": _normalize_bool(source.get("save_images"), bool(DEFAULT_IMAGE_STORAGE["save_images"])),
         "enabled": enabled,
         "mode": mode,
         "webdav_url": str(source.get("webdav_url") or "").strip().rstrip("/"),
@@ -306,6 +313,22 @@ def _normalize_auth_key(value: object) -> str:
     return str(value or "").strip()
 
 
+def _normalize_model_slug(value: object, default: str) -> str:
+    slug = str(value or "").strip()
+    if not slug or slug == "auto":
+        return default
+    return slug if MODEL_SLUG_RE.fullmatch(slug) else default
+
+
+def _normalize_image_thinking_effort(value: object) -> str:
+    effort = str(value or "").strip().lower()
+    if effort in {"xhigh", "max", "ultra"}:
+        return "extended"
+    if effort in IMAGE_THINKING_EFFORT_OPTIONS:
+        return effort
+    return IMAGE_THINKING_EFFORT_DEFAULT
+
+
 def _is_invalid_auth_key(value: object) -> bool:
     return _normalize_auth_key(value) == ""
 
@@ -399,6 +422,23 @@ class ConfigStore:
             return 120
 
     @property
+    def image_stream_idle_timeout_secs(self) -> float:
+        try:
+            return max(15.0, float(self.data.get("image_stream_idle_timeout_secs", 75.0)))
+        except (TypeError, ValueError):
+            return 75.0
+
+    @property
+    def web_image_model_slug(self) -> str:
+        """底层 ChatGPT 网页生图模型 slug，用于无前缀 gpt-image-2。"""
+        return _normalize_model_slug(self.data.get("web_image_model_slug"), WEB_IMAGE_DEFAULT_MODEL_SLUG)
+
+    @property
+    def image_thinking_effort(self) -> str:
+        """ChatGPT 网页图片链路的 thinking_effort。"""
+        return _normalize_image_thinking_effort(self.data.get("image_thinking_effort"))
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
             return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
@@ -421,6 +461,22 @@ class ConfigStore:
             return max(1, int(self.data.get("image_account_concurrency", 3)))
         except (TypeError, ValueError):
             return 3
+
+    @property
+    def image_slot_wait_timeout_secs(self) -> float:
+        """账号并发槽位等待总超时（秒）；0 表示不限时（不建议）。"""
+        try:
+            return max(0.0, float(self.data.get("image_slot_wait_timeout_secs", 90.0)))
+        except (TypeError, ValueError):
+            return 90.0
+
+    @property
+    def image_task_max_pending(self) -> int:
+        """image-task 队列未完成任务上限，防止公网调用方无限堆积任务线程。"""
+        try:
+            return max(1, int(self.data.get("image_task_max_pending", 200)))
+        except (TypeError, ValueError):
+            return 200
 
     @property
     def image_parallel_generation(self) -> bool:
@@ -551,9 +607,14 @@ class ConfigStore:
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+        data["image_stream_idle_timeout_secs"] = self.image_stream_idle_timeout_secs
+        data["web_image_model_slug"] = self.web_image_model_slug
+        data["image_thinking_effort"] = self.image_thinking_effort
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_slot_wait_timeout_secs"] = self.image_slot_wait_timeout_secs
+        data["image_task_max_pending"] = self.image_task_max_pending
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
@@ -600,6 +661,15 @@ class ConfigStore:
         if "image_storage" in next_data:
             next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
             _validate_image_storage_settings(next_data["image_storage"])
+        if "web_image_model_slug" in next_data:
+            next_data["web_image_model_slug"] = _normalize_model_slug(
+                next_data.get("web_image_model_slug"),
+                WEB_IMAGE_DEFAULT_MODEL_SLUG,
+            )
+        if "image_thinking_effort" in next_data:
+            next_data["image_thinking_effort"] = _normalize_image_thinking_effort(
+                next_data.get("image_thinking_effort"),
+            )
         if "chat_completion_cache" in next_data:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")

@@ -35,7 +35,7 @@ def _is_upload(value: object) -> TypeGuard[UploadFile]:
     return isinstance(value, UploadFile)
 
 
-def _parse_bool(value: object) -> bool | None:
+def _parse_bool(value: object, field_name: str = "stream") -> bool | None:
     """解析布尔字段：兼容 JSON 布尔值和表单字符串。"""
     if value is None or value == "":
         return None
@@ -46,7 +46,7 @@ def _parse_bool(value: object) -> bool | None:
         return True
     if text in {"false", "0", "no", "n", "off"}:
         return False
-    raise HTTPException(status_code=400, detail={"error": "stream must be a boolean"})
+    raise HTTPException(status_code=400, detail={"error": f"{field_name} must be a boolean"})
 
 
 def _parse_count(value: object) -> int:
@@ -73,6 +73,14 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "quality": _clean(fields.get("quality"), "auto"),
         "response_format": _clean(fields.get("response_format"), "b64_json"),
         "stream": _parse_bool(fields.get("stream")),
+        # 透传用户提示词，不把 size / quality 改写成额外自然语言。
+        # 用于需要与 ChatGPT 网页端用户消息完全一致的图片任务。
+        "verbatim_prompt": bool(_parse_bool(fields.get("verbatim_prompt"), "verbatim_prompt") or False),
+        # 显式任务信号（可选）：task_type=background_removal 走本地抠图；
+        # 其它非空 task_type 表示生成式编辑，禁用 prompt 关键词兜底。
+        "task_type": _clean(fields.get("task_type")),
+        "background": _clean(fields.get("background")),
+        "output_background": _clean(fields.get("output_background")),
     }
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
@@ -183,7 +191,11 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
+    for key in (
+        "client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream",
+        "verbatim_prompt",
+        "task_type", "background", "output_background",
+    ):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value

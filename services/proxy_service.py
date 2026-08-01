@@ -11,9 +11,27 @@ from typing import Callable, Mapping
 from urllib import request as urllib_request
 from urllib.parse import quote, urlparse
 
+from curl_cffi.const import CurlOpt
 from curl_cffi.requests import Session
 
 from services.config import config
+
+
+# Default libcurl options applied to every outbound Session as a defensive
+# bound on connection lifetime. curl_cffi (unlike httpx) has no first-class
+# limits/pool-size API, so we set these via native curl options:
+#   * MAXCONNECTS  — cap the keepalive connection cache so leaked sessions
+#     cannot leave an unbounded number of sockets lingering.
+#   * TCP_KEEPALIVE / TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT — let the
+#     kernel detect and reap half-closed/dead connections instead of them
+#     parking in CLOSE-WAIT until GC eventually collects the Session.
+_DEFAULT_SESSION_CURL_OPTIONS: dict[CurlOpt, int] = {
+    CurlOpt.MAXCONNECTS: 10,
+    CurlOpt.TCP_KEEPALIVE: 1,
+    CurlOpt.TCP_KEEPIDLE: 60,
+    CurlOpt.TCP_KEEPINTVL: 15,
+    CurlOpt.TCP_KEEPCNT: 3,
+}
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
@@ -230,6 +248,13 @@ class ProxySettingsStore:
             session_kwargs["proxy"] = profile.proxy_url
         if profile.runtime_enabled and profile.skip_ssl_verify:
             session_kwargs["verify"] = False
+        # Merge native libcurl options, letting any caller-provided curl_options
+        # override our defensive defaults (do not clobber them).
+        existing = session_kwargs.get("curl_options")
+        merged = dict(_DEFAULT_SESSION_CURL_OPTIONS)
+        if isinstance(existing, dict):
+            merged.update(existing)
+        session_kwargs["curl_options"] = merged
         return session_kwargs
 
     def build_headers(

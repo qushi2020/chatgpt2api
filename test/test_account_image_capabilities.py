@@ -11,7 +11,7 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 from services.account_service import AccountService
 from services.auth_service import AuthService
 from services.config import config
-from services.openai_backend_api import InvalidAccessTokenError
+from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
@@ -68,13 +68,29 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(updated["quota"], 0)
             self.assertEqual(updated["status"], "限流")
 
-    def test_split_image_model_supports_plan_type_prefix(self) -> None:
+    def test_split_image_model_only_supports_codex_plan_type_prefix(self) -> None:
         self.assertEqual(split_image_model("gpt-image-2"), (None, "gpt-image-2"))
+        for prefix in ("plus", "team", "pro"):
+            self.assertEqual(split_image_model(f"{prefix}-gpt-image-2"), (None, None))
         self.assertEqual(split_image_model("plus-codex-gpt-image-2"), ("plus", "codex-gpt-image-2"))
         self.assertEqual(split_image_model("team-codex-gpt-image-2"), ("team", "codex-gpt-image-2"))
         self.assertEqual(split_image_model("pro-codex-gpt-image-2"), ("pro", "codex-gpt-image-2"))
-        self.assertEqual(split_image_model("plus-gpt-image-2"), (None, None))
         self.assertEqual(split_image_model("unknown-image-model"), (None, None))
+
+    def test_unprefixed_web_image_model_uses_configured_slug(self) -> None:
+        original_value = config.data.get("web_image_model_slug")
+        backend = OpenAIBackendAPI()
+        try:
+            config.data["web_image_model_slug"] = "gpt-5-6-free"
+            backend.account = {"type": "free", "default_model_slug": "gpt-5-3"}
+            self.assertEqual(backend._image_model_slug("gpt-image-2"), "gpt-5-6-free")
+            self.assertEqual(backend._image_model_slug("pro-" + "gpt-image-2"), "auto")
+        finally:
+            if original_value is None:
+                config.data.pop("web_image_model_slug", None)
+            else:
+                config.data["web_image_model_slug"] = original_value
+            backend.close()
 
     def test_get_available_access_token_filters_by_plan_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

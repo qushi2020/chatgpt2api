@@ -149,6 +149,21 @@ def is_model_text_reply_instead_of_image(message: str) -> bool:
     return False
 
 
+# 上游"结果暂时取不到/响应不完整"类兜底消息：属于临时故障，应换账号重试，
+# 不能当成内容策略违规直接失败。与 stream_image_outputs 的兜底文案保持对应。
+RETRYABLE_UPSTREAM_MESSAGE_PATTERNS = (
+    "result could not be retrieved",
+    "response was incomplete",
+    "may still be processing",
+    "please try again",
+)
+
+
+def is_retryable_upstream_message(message: str) -> bool:
+    low = str(message or "").lower()
+    return any(pattern in low for pattern in RETRYABLE_UPSTREAM_MESSAGE_PATTERNS)
+
+
 def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
@@ -228,6 +243,12 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
+def final_image_prompt(prompt: str, size: str | None, quality: str = "auto", verbatim: bool = False) -> str:
+    if verbatim:
+        return prompt.strip()
+    return prompt_with_global_system(build_image_prompt(prompt, size, quality))
+
+
 def encoding_for_model(model: str):
     try:
         return tiktoken.encoding_for_model(model)
@@ -282,11 +303,11 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
-            data.append({
-                "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
+            entry: dict[str, Any] = {"b64_json": b64_json, "revised_prompt": revised_prompt}
+            # 关闭保存时不再附带 url，避免 data URL 与 b64_json 重复内联同一张图
+            if image_storage_service.save_enabled():
+                entry["url"] = save_image_bytes(base64.b64decode(b64_json), base_url)
+            data.append(entry)
         else:
             data.append({
                 "url": save_image_bytes(base64.b64decode(b64_json), base_url),
@@ -308,6 +329,7 @@ class ConversationRequest:
     n: int = 1
     size: str | None = None
     quality: str = "auto"
+    verbatim_prompt: bool = False
     response_format: str = "b64_json"
     base_url: str | None = None
     message_as_error: bool = False
@@ -662,13 +684,14 @@ def conversation_events(
     images: list[str] | None = None,
     size: str | None = None,
     quality: str = "auto",
+    verbatim_prompt: bool = False,
     thinking_effort: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
-    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
+    final_prompt = final_image_prompt(prompt, size, quality, verbatim_prompt) if image_model else prompt
     payloads = backend.stream_conversation(
         messages=normalized,
         model=model,
@@ -726,6 +749,10 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         finally:
             if active_backend is not None:
                 active_backend.close()
+            # 外层传入的 backend（由 text_backend() / MessageRequest 等专门为本调用创建）
+            # 同样必须关闭，否则其 curl_cffi Session 及到上游 443 的 keepalive 连接会
+            # 因 GC 不可靠而长期滞留成 CLOSE-WAIT，进而造成内存泄漏。
+            backend.close()
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -813,6 +840,7 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            verbatim_prompt=request.verbatim_prompt,
     ):
         last = event
         if event.get("type") == "conversation.delta":
@@ -1314,6 +1342,17 @@ def _generate_single_image(
                 if account_email and not output.account_email:
                     output.account_email = account_email
                 if output.kind == "message" and request.message_as_error:
+                    # "结果暂时取不到/响应不完整"类消息是临时故障：按 502 抛出，
+                    # 让下面的重试逻辑换账号重试，且不误标为内容策略违规。
+                    if is_retryable_upstream_message(output.text):
+                        raise ImageGenerationError(
+                            output.text,
+                            status_code=502,
+                            error_type="server_error",
+                            code="upstream_incomplete",
+                            account_email=account_email,
+                            conversation_id=output.conversation_id,
+                        )
                     raise ImageGenerationError(
                         output.text or "Image generation was rejected by upstream policy.",
                         status_code=400,
@@ -1348,27 +1387,28 @@ def _generate_single_image(
             account_service.mark_image_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
-            # 轮询超时：换账号重试
-            if not emitted_for_token:
-                poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
-                    logger.warning({
-                        "event": "image_poll_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": poll_timeout_retry_count,
-                        "index": index,
-                        "error": str(exc)[:200],
-                    })
-                    continue
+            # 轮询超时：换账号重试。
+            # 注意：本函数对每次尝试的输出做完整缓冲，重试不会向客户端重复输出，
+            # 因此不能用 emitted_for_token（SSE 一开始就会置真）作为重试门槛——
+            # 轮询超时必然发生在 SSE 之后，用它做门槛会让重试永远不生效。
+            poll_timeout_retry_count += 1
+            if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                 logger.warning({
-                    "event": "image_poll_timeout_exhausted_retries",
+                    "event": "image_poll_timeout_retry",
                     "request_token": token,
                     "account_email": account_email,
                     "retry_count": poll_timeout_retry_count,
                     "index": index,
+                    "error": str(exc)[:200],
                 })
-                raise
+                continue
+            logger.warning({
+                "event": "image_poll_timeout_exhausted_retries",
+                "request_token": token,
+                "account_email": account_email,
+                "retry_count": poll_timeout_retry_count,
+                "index": index,
+            })
             raise
         except ImageContentPolicyError as exc:
             account_service.mark_image_result(token, False)
@@ -1392,8 +1432,9 @@ def _generate_single_image(
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
-            # 如果是模型返回文本而非图片，尝试换账号重试
-            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+            # 模型返回文本而非图片 / 上游返回不完整结果：换账号重试。
+            # 输出按尝试完整缓冲，重试安全，不以 emitted_for_token 为门槛（见轮询超时分支注释）。
+            if is_model_text_reply_instead_of_image(error_text) or is_retryable_upstream_message(error_text):
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
@@ -1412,12 +1453,21 @@ def _generate_single_image(
                     "retry_count": text_reply_retry_count,
                     "index": index,
                 })
+                if is_model_text_reply_instead_of_image(error_text):
+                    raise ImageGenerationError(
+                        "Image generation failed: the upstream model returned a text description "
+                        "instead of generating an image. Please try again later.",
+                        status_code=502,
+                        error_type="server_error",
+                        code="upstream_text_reply",
+                        account_email=account_email,
+                        conversation_id=getattr(exc, "conversation_id", ""),
+                    ) from exc
                 raise ImageGenerationError(
-                    "Image generation failed: the upstream model returned a text description "
-                    "instead of generating an image. Please try again later.",
+                    "图像上游多次返回不完整结果，暂时未取到图片，请稍后重试",
                     status_code=502,
                     error_type="server_error",
-                    code="upstream_text_reply",
+                    code="upstream_incomplete",
                     account_email=account_email,
                     conversation_id=getattr(exc, "conversation_id", ""),
                 ) from exc
@@ -1439,15 +1489,16 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
-            if not emitted_for_token and is_token_invalid_error(last_error):
+            if is_token_invalid_error(last_error):
+                # 刷新成功则该账号回池等待下轮取号；失败则移除。
+                # 循环起点会重新 get_available_access_token，这里不直接复用刷新后的 token。
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
-                    token = refreshed_token
                     continue
                 account_service.remove_invalid_token(token, "image_stream")
                 continue
             # TLS/SSL 连接错误：自动重试
-            if not emitted_for_token and is_tls_connection_error(last_error):
+            if is_tls_connection_error(last_error):
                 tls_retry_count += 1
                 if tls_retry_count <= MAX_TLS_RETRIES:
                     logger.warning({
@@ -1461,7 +1512,7 @@ def _generate_single_image(
                     time.sleep(min(2.0 * tls_retry_count, 10.0))
                     continue
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
-            if not emitted_for_token and is_connection_timeout_error(last_error):
+            if is_connection_timeout_error(last_error):
                 conn_timeout_retry_count += 1
                 if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
                     wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)

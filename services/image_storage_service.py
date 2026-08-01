@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -175,6 +176,9 @@ class ImageStorageService:
     def mode(self) -> str:
         return _clean(self.settings().get("mode")) or "local"
 
+    def save_enabled(self) -> bool:
+        return bool(self.settings().get("save_images", True))
+
     def _load_index(self) -> dict[str, dict[str, object]]:
         raw = _read_json_object(self.index_file)
         items = raw.get("items")
@@ -203,6 +207,9 @@ class ImageStorageService:
         return f"{relative_dir.as_posix()}/{filename}"
 
     def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
+        if not self.save_enabled():
+            data_url = f"data:image/png;base64,{base64.b64encode(image_data).decode('ascii')}"
+            return StoredImage(rel="", url=data_url, storage="none", size=len(image_data))
         config.cleanup_old_images()
         rel = self.make_relative_path(image_data)
         mode = self.mode()

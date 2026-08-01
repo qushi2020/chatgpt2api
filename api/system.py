@@ -8,8 +8,9 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from api.support import require_admin, require_identity, resolve_image_base_url
+from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
-from services.config import config
+from services.config import MODEL_SLUG_RE, WEB_IMAGE_DEFAULT_MODEL_SLUG, config
 from services.image_service import (
     compress_images,
     delete_images,
@@ -24,6 +25,7 @@ from services.image_service import (
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
+from services.openai_backend_api import OpenAIBackendAPI
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
 
 
@@ -58,6 +60,49 @@ class BackupDeleteRequest(BaseModel):
     key: str = ""
 
 
+def free_web_image_model_slug_options() -> dict[str, object]:
+    """Return ChatGPT model slugs available to free web accounts for gpt-image-2 mapping."""
+    fallback_slugs = {WEB_IMAGE_DEFAULT_MODEL_SLUG, config.web_image_model_slug}
+    accounts = [
+        item
+        for item in account_service.list_accounts()
+        if isinstance(item, dict)
+           and account_service._normalize_source_type(item.get("source_type")) != "codex"
+           and account_service._normalize_account_type(item.get("type")) == "free"
+    ]
+    for item in accounts:
+        default_slug = str(item.get("default_model_slug") or "").strip()
+        if MODEL_SLUG_RE.fullmatch(default_slug) and default_slug != "auto":
+            fallback_slugs.add(default_slug)
+
+    last_error = ""
+    for item in accounts:
+        if str(item.get("status") or "").strip() in {"禁用", "异常"}:
+            continue
+        token = str(item.get("access_token") or "").strip()
+        if not token:
+            continue
+        backend = OpenAIBackendAPI(access_token=token)
+        try:
+            result = backend.list_models()
+            slugs = {
+                slug
+                for model in result.get("data", [])
+                if isinstance(model, dict)
+                   and (slug := str(model.get("id") or "").strip())
+                   and MODEL_SLUG_RE.fullmatch(slug)
+            }
+            if slugs:
+                slugs.update(fallback_slugs)
+                return {"items": sorted(slugs), "source": "free_web_account", "error": ""}
+        except Exception as exc:
+            last_error = str(exc)[:300]
+        finally:
+            backend.close()
+
+    return {"items": sorted(fallback_slugs), "source": "fallback", "error": last_error}
+
+
 def create_router(app_version: str) -> APIRouter:
     router = APIRouter()
 
@@ -80,6 +125,11 @@ def create_router(app_version: str) -> APIRouter:
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"config": config.get()}
+
+    @router.get("/api/settings/free-web-image-model-slugs")
+    async def get_free_web_image_model_slug_options(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(free_web_image_model_slug_options)
 
     @router.get("/api/third-party-apps")
     async def get_third_party_apps(authorization: str | None = Header(default=None)):

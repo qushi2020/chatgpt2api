@@ -87,7 +87,12 @@ class ImageTasksApiTests(unittest.TestCase):
         response = self.client.post(
             "/api/image-tasks/edits",
             headers=AUTH_HEADERS,
-            data={"client_task_id": "edit-1", "prompt": "edit", "model": "gpt-image-2"},
+            data={
+                "client_task_id": "edit-1",
+                "prompt": "edit",
+                "model": "gpt-image-2",
+                "verbatim_prompt": "true",
+            },
             files=[
                 ("image", ("one.png", b"one", "image/png")),
                 ("image", ("two.png", b"two", "image/png")),
@@ -99,6 +104,7 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(len(self.fake_service.edit_calls), 1)
         images = self.fake_service.edit_calls[0][1]["images"]
         self.assertEqual(len(images), 2)
+        self.assertTrue(self.fake_service.edit_calls[0][1]["verbatim_prompt"])
 
     def test_create_edit_task_accepts_image_url(self):
         """测试图片编辑任务接口支持表单 image_url 引用。"""

@@ -2,7 +2,9 @@ import base64
 import hashlib
 import json
 import mimetypes
+import queue
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -14,15 +16,16 @@ from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
-BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
-IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
+WEB_IMAGE_MODEL = "gpt-image-2"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+BASE_IMAGE_MODELS = {WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL}
+IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 PREFIXED_CODEX_IMAGE_MODELS = {
     f"{plan_type}-{CODEX_IMAGE_MODEL}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
-PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
+PUBLIC_IMAGE_MODELS = IMAGE_MODELS
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
@@ -30,6 +33,10 @@ MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+
+
+class SseIdleTimeoutError(TimeoutError):
+    pass
 
 
 def _image_extension(mime_type: str) -> str:
@@ -113,11 +120,9 @@ def split_image_model(model: object) -> tuple[str | None, str | None]:
     if normalized in BASE_IMAGE_MODELS:
         return None, normalized
     for plan_type in IMAGE_MODEL_PLAN_TYPES:
-        prefix = f"{plan_type}-"
-        if normalized.startswith(prefix):
-            base_model = normalized[len(prefix):]
-            if base_model == CODEX_IMAGE_MODEL:
-                return plan_type, base_model
+        prefixed_codex = f"{plan_type}-{CODEX_IMAGE_MODEL}"
+        if normalized == prefixed_codex:
+            return plan_type, CODEX_IMAGE_MODEL
     return None, None
 
 
@@ -226,7 +231,7 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
+def _iter_sse_payloads_direct(response: requests.Response) -> Iterator[str]:
     for raw_line in response.iter_lines():
         if not raw_line:
             continue
@@ -236,6 +241,43 @@ def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
         payload = line[5:].strip()
         if payload:
             yield payload
+
+
+def iter_sse_payloads(response: requests.Response, idle_timeout_secs: float | None = None) -> Iterator[str]:
+    try:
+        idle_timeout = float(idle_timeout_secs or 0)
+    except (TypeError, ValueError):
+        idle_timeout = 0.0
+    if idle_timeout <= 0:
+        yield from _iter_sse_payloads_direct(response)
+        return
+
+    events: queue.Queue[tuple[str, object]] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            for payload in _iter_sse_payloads_direct(response):
+                events.put(("payload", payload))
+        except BaseException as exc:
+            events.put(("error", exc))
+        finally:
+            events.put(("done", None))
+
+    threading.Thread(target=_reader, name="sse-payload-reader", daemon=True).start()
+
+    while True:
+        try:
+            kind, value = events.get(timeout=idle_timeout)
+        except queue.Empty as exc:
+            raise SseIdleTimeoutError(
+                f"read timed out: upstream SSE stream idle for {idle_timeout:.0f}s"
+            ) from exc
+        if kind == "payload":
+            yield str(value)
+            continue
+        if kind == "error":
+            raise value
+        return
 
 
 def save_images_from_text(text: str, prefix: str) -> list[Path]:

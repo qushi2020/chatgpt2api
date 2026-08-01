@@ -17,6 +17,7 @@ class ImageGenerationTaskRequest(BaseModel):
     model: str = "gpt-image-2"
     size: str | None = None
     quality: str = "auto"
+    verbatim_prompt: bool = False
 
 
 class ResumePollRequest(BaseModel):
@@ -63,6 +64,7 @@ def create_router() -> APIRouter:
                 model=body.model,
                 size=body.size,
                 quality=body.quality,
+                verbatim_prompt=body.verbatim_prompt,
                 base_url=resolve_image_base_url(request),
             )
         except ValueError as exc:
@@ -92,9 +94,13 @@ def create_router() -> APIRouter:
                 model=model,
                 size=payload["size"],
                 quality=payload["quality"],
+                verbatim_prompt=bool(payload.get("verbatim_prompt")),
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,
+                task_type=str(payload.get("task_type") or ""),
+                background=str(payload.get("background") or ""),
+                output_background=str(payload.get("output_background") or ""),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
