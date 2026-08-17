@@ -34,7 +34,15 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
-class ImagePollTimeoutError(RuntimeError):
+class ImageTaskError(RuntimeError):
+    """图片生成异常基类，携带上游会话 ID 供调用方清理对话。"""
+
+    def __init__(self, message: str = "", conversation_id: str = "") -> None:
+        super().__init__(message)
+        self.conversation_id = conversation_id
+
+
+class ImagePollTimeoutError(ImageTaskError):
     pass
 
 
@@ -43,8 +51,13 @@ class ImageRequestAbortedError(RuntimeError):
     pass
 
 
-class ImageContentPolicyError(RuntimeError):
+class ImageContentPolicyError(ImageTaskError):
     """Raised when image generation is blocked by content policy moderation."""
+    pass
+
+
+class ImageStreamHardTimeoutError(RuntimeError):
+    """图片 SSE 流读取超过硬上限时抛出，用于快速中断被挂起的长连接。"""
     pass
 
 
@@ -741,9 +754,9 @@ class OpenAIBackendAPI:
     @staticmethod
     def _normalize_thinking_effort(value: str) -> str:
         normalized = str(value or "").strip().lower()
-        if normalized in {"", "none"}:
+        if normalized in {"", "none", "auto"}:
             return ""
-        if normalized in {"low", "medium", "high"}:
+        if normalized in {"low", "medium", "high", "standard", "max"}:
             return normalized
         if normalized in {"xhigh", "extended"}:
             return "extended"
@@ -787,21 +800,28 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
-        normalized_effort = self._normalize_thinking_effort(thinking_effort)
+        normalized_effort = self._normalize_thinking_effort(thinking_effort or config.default_thinking_effort)
         if normalized_effort:
             payload["thinking_effort"] = normalized_effort
         return payload
 
-    def _image_model_slug(self, model: str) -> str:
-        """把标准图片模型名映射到底层 model slug。"""
+    def _image_model_settings(self, model: str) -> tuple[str, str]:
+        """把标准图片模型名映射为上游模型及思考强度。"""
         _, base_model = split_image_model(model)
         if not base_model:
-            return "auto"
+            return "auto", ""
         if base_model == "gpt-image-2":
-            return config.web_image_model_slug
-        if base_model == CODEX_IMAGE_MODEL:
-            return base_model
-        return "auto"
+            upstream_model = config.web_image_model_slug
+        elif base_model == CODEX_IMAGE_MODEL:
+            upstream_model = base_model
+        else:
+            return "auto", ""
+        model_name, separator, suffix = upstream_model.rpartition("-")
+        if separator and suffix.lower() in {"standard", "extended", "max"}:
+            return model_name, suffix.lower()
+        return upstream_model, self._normalize_thinking_effort(
+            config.image_thinking_effort or config.default_thinking_effort
+        )
 
     def _image_headers(
             self,
@@ -1174,11 +1194,12 @@ class OpenAIBackendAPI:
         message_id = message_id or new_uuid()
         create_time = create_time or time.time()
         path = "/backend-api/f/conversation/prepare"
+        upstream_model, thinking_effort = self._image_model_settings(model)
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
             "parent_message_id": parent_message_id,
-            "model": self._image_model_slug(model),
+            "model": upstream_model,
             "client_prepare_state": "none",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -1190,10 +1211,11 @@ class OpenAIBackendAPI:
             "supports_buffering": True,
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
-            "thinking_effort": config.image_thinking_effort,
         }
         if references:
             payload["attachment_mime_types"] = [item["mime_type"] for item in references]
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(
@@ -1322,6 +1344,7 @@ class OpenAIBackendAPI:
             turn_trace_id: str = "",
     ) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
+        upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
         message_id = message_id or new_uuid()
         create_time = create_time or time.time()
@@ -1331,7 +1354,7 @@ class OpenAIBackendAPI:
                 prompt, references, message_id, create_time,
             )],
             "parent_message_id": parent_message_id,
-            "model": self._image_model_slug(model),
+            "model": upstream_model,
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -1352,6 +1375,8 @@ class OpenAIBackendAPI:
             },
             "thinking_effort": config.image_thinking_effort,
         }
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
@@ -2601,7 +2626,7 @@ class OpenAIBackendAPI:
                         "attempt": attempt,
                         "error_msg": policy_msg[:200],
                     })
-                    raise ImageContentPolicyError(policy_msg)
+                    raise ImageContentPolicyError(policy_msg, conversation_id or "")
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
@@ -2647,11 +2672,11 @@ class OpenAIBackendAPI:
         exc = ImagePollTimeoutError(
             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
-            f"也可能是账号被限流或生图队列拥堵导致。"
+            f"也可能是账号被限流或生图队列拥堵导致。",
+            conversation_id or "",
         )
         if last_task_error:
             setattr(exc, "task_error", last_task_error)
-        setattr(exc, "conversation_id", conversation_id or "")
         raise exc
 
     def _get_file_download_url(self, file_id: str) -> str:
@@ -2864,7 +2889,7 @@ class OpenAIBackendAPI:
                 task_error = getattr(exc, "task_error", "")
                 if not file_ids and not sediment_ids:
                     if task_error:
-                        raise ImageContentPolicyError(task_error) from exc
+                        raise ImageContentPolicyError(task_error, conversation_id or "") from exc
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
@@ -2993,8 +3018,9 @@ class OpenAIBackendAPI:
         self._report_progress("generating")
         close_in_background = False
         try:
-            yield from iter_sse_payloads(
+            yield from self._iter_sse_payloads_capped(
                 response,
+                float(config.image_poll_timeout_secs),
                 idle_timeout_secs=getattr(config, "image_stream_idle_timeout_secs", 75.0),
             )
         except SseIdleTimeoutError:
@@ -3003,8 +3029,50 @@ class OpenAIBackendAPI:
         finally:
             if close_in_background:
                 self._close_response_later(response, "image_sse_idle_timeout")
-            else:
-                response.close()
+
+    def _iter_sse_payloads_capped(
+        self,
+        response: Any,
+        hard_cap_secs: float,
+        idle_timeout_secs: float | None = None,
+    ) -> Iterator[str]:
+        """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
+
+        curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
+        上游未生成图片却保持连接时，读取会一直阻塞直到边缘重置（曾观测到单条流
+        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为硬上限：到点后关闭
+        底层连接以解除阻塞，并抛出明确错误，让任务快速失败而非长时间挂起。
+        """
+        deadline = time.monotonic() + hard_cap_secs
+        # 看门狗：SSE 读取可能阻塞在底层 curl 调用中，超时后关闭连接以强制解除阻塞
+        watchdog = threading.Timer(hard_cap_secs, response.close)
+        watchdog.daemon = True
+        watchdog.start()
+        timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
+        idle_timed_out = False
+        try:
+            for payload in iter_sse_payloads(response, idle_timeout_secs=idle_timeout_secs):
+                yield payload
+                if time.monotonic() >= deadline:
+                    raise ImageStreamHardTimeoutError(timeout_message)
+        except ImageStreamHardTimeoutError:
+            raise
+        except SseIdleTimeoutError:
+            idle_timed_out = True
+            raise
+        except Exception as exc:
+            # 看门狗关闭连接后，底层读取会抛出 curl 错误，这里统一转成明确的硬上限错误
+            if time.monotonic() >= deadline:
+                raise ImageStreamHardTimeoutError(timeout_message) from exc
+            raise
+        finally:
+            watchdog.cancel()
+            # 空闲超时时由调用方在后台线程关闭，避免 close 阻塞在残留数据上
+            if not idle_timed_out:
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
