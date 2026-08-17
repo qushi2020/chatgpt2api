@@ -398,9 +398,11 @@ td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{b
 <div class="card"><div class="label">当前账号</div><div class="value blue">{stats['total']}</div></div>
 <div class="card"><div class="label">累计入库</div><div class="value">{stats['cumulative_total']}</div></div>
 <div class="card"><div class="label">可用账号</div><div class="value green">{stats['active']}</div></div>
-<div class="card"><div class="label">剩余额度</div><div class="value">{stats['total_quota']}</div></div>
+<div class="card"><div class="label">已知图片剩余额度</div><div class="value">{stats['total_quota']}</div></div>
+<div class="card"><div class="label">图片额度未知账号</div><div class="value">{stats['unknown_quota_count']}</div></div>
 <div class="card"><div class="label">限流</div><div class="value yellow">{stats['limited']}</div></div>
 <div class="card"><div class="label">异常</div><div class="value red">{stats['abnormal']}</div></div>
+<div class="card"><div class="label">需重新授权</div><div class="value yellow">{stats['reauth_required']}</div></div>
 <div class="card"><div class="label">禁用</div><div class="value">{stats['disabled']}</div></div>
 <div class="card"><div class="label">成功/失败</div><div class="value">{stats['total_success']}<span style="font-size:18px;color:#94a3b8">/</span><span class="red">{stats['total_fail']}</span></div></div>
 </div>

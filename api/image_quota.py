@@ -51,12 +51,22 @@ def _image_quota_unknown(account: dict[str, Any]) -> bool:
 
 
 def _is_active(account: dict[str, Any]) -> bool:
-    return _status(account) == "正常"
+    return (
+        _status(account) == "正常"
+        and account.get("last_token_refresh_error_kind") != "reauth_required"
+    )
 
 
 def _is_image_available(account: dict[str, Any]) -> bool:
     if not _is_active(account):
         return False
+    if account.get("last_token_refresh_error_kind") == "reauth_required":
+        return False
+    if str(account.get("source_type") or "").strip().lower() == "codex":
+        codex_available = account.get("codex_available")
+        if codex_available is not None:
+            return bool(codex_available)
+        return _quota(account) > 0
     if _image_quota_unknown(account):
         return True
     return _quota(account) > 0

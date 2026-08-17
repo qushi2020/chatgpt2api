@@ -116,8 +116,21 @@ function formatConversationTime(value: string) {
 }
 
 function formatAvailableQuota(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status !== "禁用");
-  return String(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+  const knownQuotaAccounts = accounts.filter(
+    (account) => account.status === "正常"
+      && account.last_token_refresh_error_kind !== "reauth_required"
+      && !account.image_quota_unknown,
+  );
+  const knownQuota = knownQuotaAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0);
+  const hasUnknownQuota = accounts.some(
+    (account) => account.status === "正常"
+      && account.last_token_refresh_error_kind !== "reauth_required"
+      && Boolean(account.image_quota_unknown),
+  );
+  if (hasUnknownQuota) {
+    return knownQuota > 0 ? `${knownQuota} + 未知` : "未知";
+  }
+  return String(knownQuota);
 }
 
 function createId() {
@@ -548,6 +561,33 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     });
   }, []);
 
+  const cleanupScrollResources = useCallback(() => {
+    if (scrollRafRef.current !== null) {
+      window.cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+    if (scrollSaveTimerRef.current !== null) {
+      clearTimeout(scrollSaveTimerRef.current);
+      scrollSaveTimerRef.current = null;
+      saveScrollPositions(scrollPositionsRef.current);
+    }
+  }, []);
+
+  const cleanupImagePage = useCallback(() => {
+    loadCancelledRef.current = true;
+    const element = resultsViewportRef.current;
+    const convId = lastConversationIdRef.current;
+    if (element && convId) {
+      scrollPositionsRef.current.set(convId, element.scrollTop);
+      saveScrollPositions(scrollPositionsRef.current);
+    }
+    activeConversationQueueIds.clear();
+    if (pollAbortController) {
+      pollAbortController.abort();
+      pollAbortController = null;
+    }
+  }, []);
+
   const handleResultsScroll = useCallback(() => {
     if (scrollRafRef.current !== null) {
       return;
@@ -591,16 +631,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   useEffect(() => {
-    return () => {
-      if (scrollRafRef.current !== null) {
-        window.cancelAnimationFrame(scrollRafRef.current);
-      }
-      if (scrollSaveTimerRef.current !== null) {
-        clearTimeout(scrollSaveTimerRef.current);
-        saveScrollPositions(scrollPositionsRef.current);
-      }
-    };
-  }, []);
+    return cleanupScrollResources;
+  }, [cleanupScrollResources]);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -667,23 +699,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     loadCancelledRef.current = false;
-    void loadHistory();
+    const loadTimer = window.setTimeout(() => void loadHistory(), 0);
     return () => {
-      loadCancelledRef.current = true;
-      // 组件卸载时保存当前滚动位置到 sessionStorage
-      const element = resultsViewportRef.current;
-      const convId = lastConversationIdRef.current;
-      if (element && convId) {
-        scrollPositionsRef.current.set(convId, element.scrollTop);
-        saveScrollPositions(scrollPositionsRef.current);
-      }
-      activeConversationQueueIds.clear();
-      if (pollAbortController) {
-        pollAbortController.abort();
-        pollAbortController = null;
-      }
+      window.clearTimeout(loadTimer);
+      cleanupImagePage();
     };
-  }, [loadHistory]);
+  }, [cleanupImagePage, loadHistory]);
 
   useEffect(() => {
     let cancelled = false;
@@ -783,7 +804,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         isRestoringScrollRef.current = true;
       }
     }
-  }, [selectedConversation?.id]);
+  }, [selectedConversation]);
 
   // 恢复滚动位置或跟随最新内容
   useEffect(() => {
@@ -836,7 +857,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
     const btn = scrollToLatestBtnRef.current;
     if (btn) btn.style.display = "";
-  }, [selectedConversation?.id, selectedConversation?.updatedAt, selectedConversation?.turns.length, scrollResultsToLatest]);
+  }, [selectedConversation, scrollResultsToLatest]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -869,7 +890,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     if (selectedConversationId && !conversations.some((conversation) => conversation.id === selectedConversationId)) {
-      setSelectedConversationId(pickFallbackConversationId(conversations));
+      const fallbackTimer = window.setTimeout(
+        () => setSelectedConversationId(pickFallbackConversationId(conversations)),
+        0,
+      );
+      return () => window.clearTimeout(fallbackTimer);
     }
   }, [conversations, selectedConversationId]);
 

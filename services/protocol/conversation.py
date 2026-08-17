@@ -709,6 +709,7 @@ def text_backend() -> OpenAIBackendAPI:
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
+    same_token_refresh_retries: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
     while True:
@@ -737,11 +738,25 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         except Exception as exc:
             error_message = str(exc)
             if token and not emitted and is_token_invalid_error(error_message):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
-                if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
-                    token = refreshed_token
+                refresh_result = account_service.refresh_access_token_result(
+                    token,
+                    force=True,
+                    event="text_stream",
+                )
+                refreshed_token = refresh_result.access_token
+                if refresh_result.succeeded and refreshed_token:
+                    if refreshed_token != token and refreshed_token not in attempted_tokens:
+                        token = refreshed_token
+                    elif token not in same_token_refresh_retries:
+                        same_token_refresh_retries.add(token)
+                        attempted_tokens.discard(token)
+                    else:
+                        token = account_service.get_text_access_token(attempted_tokens)
                 else:
-                    account_service.remove_invalid_token(token, "text_stream")
+                    # refresh token 永久失效也不等于当前 access token 或账号失效。
+                    # 仅在没有刷新能力或刷新明确永久失败时，用来源健康端点做最终确认。
+                    if refresh_result.error_kind in {None, "permanent"}:
+                        account_service.confirm_invalid_access_token(token, "text_stream")
                     token = account_service.get_text_access_token(attempted_tokens)
                 if token:
                     continue
@@ -1303,6 +1318,7 @@ def _generate_single_image(
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    invalid_token_refresh_retry_count = 0
     account_email = ""
 
     while True:
@@ -1490,13 +1506,26 @@ def _generate_single_image(
                 "index": index,
             })
             if is_token_invalid_error(last_error):
-                # 刷新成功则该账号回池等待下轮取号；失败则移除。
-                # 循环起点会重新 get_available_access_token，这里不直接复用刷新后的 token。
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
-                if refreshed_token and refreshed_token != token:
-                    continue
-                account_service.remove_invalid_token(token, "image_stream")
-                continue
+                # 仅确认永久失效时移除；暂时性刷新故障必须保留账号。
+                refresh_result = account_service.refresh_access_token_result(
+                    token,
+                    force=True,
+                    event="image_stream",
+                )
+                if refresh_result.succeeded and refresh_result.access_token:
+                    if invalid_token_refresh_retry_count == 0:
+                        invalid_token_refresh_retry_count += 1
+                        continue
+                    raise RuntimeError(
+                        "image endpoint remained unauthorized after a successful token refresh"
+                    ) from exc
+                if refresh_result.error_kind in {None, "permanent"}:
+                    confirmed_unusable = account_service.confirm_invalid_access_token(token, "image_stream")
+                    current_account = account_service.get_account(token) or {}
+                    if confirmed_unusable or not account_service._is_image_account_available(current_account):
+                        continue
+                # 单个能力端点的 401 或暂时性刷新失败不足以证明账号永久失效。
+                raise
             # TLS/SSL 连接错误：自动重试
             if is_tls_connection_error(last_error):
                 tls_retry_count += 1

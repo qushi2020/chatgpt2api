@@ -80,6 +80,27 @@ class ImageQuotaApiTests(unittest.TestCase):
         app.include_router(image_quota_module.create_router())
         self.client = TestClient(app)
 
+    def test_codex_availability_uses_codex_health_signal(self) -> None:
+        account = {
+            "source_type": "codex",
+            "status": "正常",
+            "quota": 0,
+            "image_quota_unknown": True,
+        }
+
+        self.assertFalse(image_quota_module._is_image_available(account))
+        self.assertFalse(image_quota_module._is_image_available({**account, "codex_available": False}))
+        self.assertTrue(image_quota_module._is_image_available({**account, "codex_available": True}))
+        self.assertFalse(
+            image_quota_module._is_image_available(
+                {
+                    **account,
+                    "codex_available": True,
+                    "last_token_refresh_error_kind": "reauth_required",
+                }
+            )
+        )
+
     def test_disabled_refresh_returns_codexmanager_compatible_payload(self) -> None:
         response = self.client.get("/image-quota?refresh=0", headers=AUTH_HEADERS)
 

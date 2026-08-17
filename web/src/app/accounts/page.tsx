@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import Image from "next/image";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps } from "react";
 import {
   Ban,
@@ -90,7 +91,7 @@ const metricCards = [
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
-  { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "quota", label: "图片剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
 function formatCompact(value: number) {
@@ -100,7 +101,22 @@ function formatCompact(value: number) {
   return String(value);
 }
 
+function requiresReauth(account: Account) {
+  return account.status !== "禁用" && account.last_token_refresh_error_kind === "reauth_required";
+}
+
 function formatQuota(account: Account) {
+  if (requiresReauth(account)) {
+    return "—";
+  }
+  if (account.source_type === "codex") {
+    return typeof account.codex_remaining_percent === "number"
+      ? `${Math.max(0, Math.min(100, account.codex_remaining_percent))}%`
+      : "—";
+  }
+  if (account.image_quota_unknown) {
+    return "—";
+  }
   return String(Math.max(0, account.quota));
 }
 
@@ -129,8 +145,22 @@ function formatRestoreAt(value?: string | null) {
 }
 
 function formatQuotaSummary(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status === "正常");
-  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+  const availableAccounts = accounts.filter(
+    (account) => account.status === "正常" && !requiresReauth(account) && !account.image_quota_unknown,
+  );
+  const knownQuota = availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0);
+  const unknownQuotaCount = accounts.filter(
+    (account) => account.status === "正常" && !requiresReauth(account) && Boolean(account.image_quota_unknown),
+  ).length;
+  return formatQuotaSummaryValues(knownQuota, unknownQuotaCount);
+}
+
+function formatQuotaSummaryValues(knownQuota: number, unknownQuotaCount: number) {
+  const formattedKnownQuota = formatCompact(knownQuota);
+  if (unknownQuotaCount > 0) {
+    return knownQuota > 0 ? `${formattedKnownQuota} + 未知` : "未知";
+  }
+  return formattedKnownQuota;
 }
 
 function maskToken(token?: string) {
@@ -202,6 +232,13 @@ function AccountsPageContent() {
   const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(null);
 
+  const clearProgressTimer = useCallback(() => {
+    if (progressRef.current) {
+      clearInterval(progressRef.current);
+      progressRef.current = null;
+    }
+  }, []);
+
   const loadAccounts = async (silent = false) => {
     if (!silent) {
       setIsLoading(true);
@@ -242,10 +279,8 @@ function AccountsPageContent() {
     void loadModels();
 
     // 清理进度条定时器
-    return () => {
-      if (progressRef.current) clearInterval(progressRef.current);
-    };
-  }, []);
+    return clearProgressTimer;
+  }, [clearProgressTimer]);
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -253,7 +288,11 @@ function AccountsPageContent() {
       const searchMatched =
         normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
       const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
-      const statusMatched = statusFilter === "all" || account.status === statusFilter;
+      const statusMatched =
+        statusFilter === "all"
+        || (statusFilter === "异常"
+          ? account.status === "异常" || requiresReauth(account)
+          : account.status === statusFilter && !requiresReauth(account));
       return searchMatched && typeMatched && statusMatched;
     });
   }, [accounts, query, statusFilter, typeFilter]);
@@ -267,9 +306,9 @@ function AccountsPageContent() {
 
   const summary = useMemo(() => {
     const total = accounts.length;
-    const active = accounts.filter((item) => item.status === "正常").length;
+    const active = accounts.filter((item) => item.status === "正常" && !requiresReauth(item)).length;
     const limited = accounts.filter((item) => item.status === "限流").length;
-    const abnormal = accounts.filter((item) => item.status === "异常").length;
+    const abnormal = accounts.filter((item) => item.status === "异常" || requiresReauth(item)).length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
     const quota = formatQuotaSummary(accounts);
 
@@ -290,7 +329,9 @@ function AccountsPageContent() {
   }, [accounts, selectedIds]);
 
   const abnormalTokens = useMemo(() => {
-    return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
+    return accounts
+      .filter((item) => item.status === "异常" || requiresReauth(item))
+      .map((item) => item.access_token);
   }, [accounts]);
 
   const paginationItems = useMemo(() => {
@@ -362,12 +403,17 @@ function AccountsPageContent() {
     // 计算非选中账号的基数（统计卡片联动用）
     const selectedTokenSet = new Set(accessTokens);
     const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
-    const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
+    const baseActive = baseAccountsList.filter((a) => a.status === "正常" && !requiresReauth(a)).length;
     const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
-    const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
+    const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常" || requiresReauth(a)).length;
     const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
-    const baseNormalAccounts = baseAccountsList.filter((a) => a.status === "正常");
+    const baseNormalAccounts = baseAccountsList.filter(
+      (a) => a.status === "正常" && !requiresReauth(a) && !a.image_quota_unknown,
+    );
     const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota), 0);
+    const baseUnknownQuotaCount = baseAccountsList.filter(
+      (a) => a.status === "正常" && !requiresReauth(a) && Boolean(a.image_quota_unknown),
+    ).length;
 
     // 显示进度条（只显示当前任务，不含分类统计）
     const total = accessTokens.length;
@@ -423,7 +469,10 @@ function AccountsPageContent() {
                 limited: runningLimited,
                 abnormal: runningAbnormal,
                 disabled: runningDisabled,
-                quota: formatCompact(baseQuotaNum + (p.total_quota ?? 0)),
+                quota: formatQuotaSummaryValues(
+                  baseQuotaNum + (p.total_quota ?? 0),
+                  baseUnknownQuotaCount + (p.unknown_quota_count ?? 0),
+                ),
               });
             }
           } catch (err) {
@@ -664,9 +713,11 @@ function AccountsPageContent() {
     setIsTestingProxy(true);
     try {
       const data = await testProxy(candidate);
-      data.result.ok
-        ? toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`)
-        : toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+      if (data.result.ok) {
+        toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+      } else {
+        toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "测试代理失败");
     } finally {
@@ -886,10 +937,12 @@ function AccountsPageContent() {
                     }}
                     title={`点击复制 ${model.id}`}
                   >
-                    <img
+                    <Image
                       src="/openai.svg"
                       alt=""
                       aria-hidden="true"
+                      width={14}
+                      height={14}
                       className="mr-1.5 size-3.5 shrink-0"
                     />
                     {model.id}
@@ -1050,7 +1103,7 @@ function AccountsPageContent() {
                     <th className="w-24 px-4 py-3">状态</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
-                    <th className="w-24 px-4 py-3">额度</th>
+                    <th className="w-24 px-4 py-3">额度/余量</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
                     <th className="w-18 px-4 py-3">在途</th>
                     <th className="w-18 px-4 py-3">成功</th>
@@ -1060,7 +1113,8 @@ function AccountsPageContent() {
                 </thead>
                 <tbody>
                   {currentRows.map((account) => {
-                    const status = statusMeta[account.status];
+                    const reauthRequired = requiresReauth(account);
+                    const status = statusMeta[reauthRequired ? "异常" : account.status];
                     const StatusIcon = status.icon;
 
                     return (
@@ -1113,7 +1167,7 @@ function AccountsPageContent() {
                             className="inline-flex items-center gap-1 rounded-md px-2 py-1"
                           >
                             <StatusIcon className="size-3.5" />
-                            {account.status}
+                            {reauthRequired ? "需重新授权" : account.status}
                           </Badge>
                         </td>
                         <td className="px-4 py-3">

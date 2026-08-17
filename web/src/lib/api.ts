@@ -23,6 +23,11 @@ export type Account = {
   source_type?: string | null;
   status: AccountStatus;
   quota: number;
+  image_quota_unknown?: boolean;
+  codex_available?: boolean | null;
+  codex_remaining_percent?: number | null;
+  last_token_refresh_error?: string | null;
+  last_token_refresh_error_kind?: string | null;
   email?: string | null;
   user_id?: string | null;
   limits_progress?: Array<{
@@ -92,6 +97,7 @@ export type RefreshProgressResponse = {
   error: string | null;
   status_counts?: Record<string, number>;
   total_quota?: number;
+  unknown_quota_count?: number;
   result?: AccountRefreshResponse | null;
   results?: Array<{ token: string; status: string; error?: string | null }>;
 };

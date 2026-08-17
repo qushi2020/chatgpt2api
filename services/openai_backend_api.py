@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import mimetypes
 import os
 import random
@@ -9,8 +10,8 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -325,24 +326,116 @@ class OpenAIBackendAPI:
         })
         return default_account
 
+    def _codex_account_id(self) -> str:
+        account_id = str(self.account.get("account_id") or "").strip()
+        if account_id:
+            return account_id
+        token_payload = account_service._decode_jwt_payload(self.access_token)
+        auth_claim = token_payload.get("https://api.openai.com/auth")
+        auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
+        return str(auth_claim.get("chatgpt_account_id") or "").strip()
+
+    def _codex_usage_headers(self) -> Dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Accept": "application/json",
+            "OpenAI-Beta": "codex-1",
+            "originator": "Codex Desktop",
+            "User-Agent": self.user_agent,
+        }
+        account_id = self._codex_account_id()
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
+        return headers
+
+    def _get_codex_usage(self) -> Dict[str, Any]:
+        path = "/backend-api/wham/usage"
+        response = self.session.get(self.base_url + path, headers=self._codex_usage_headers(), timeout=20)
+        if response.status_code != 200:
+            self._raise_on_error(response, path)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{path} returned invalid payload")
+        return payload
+
+    @staticmethod
+    def _codex_reset_iso(window: Dict[str, Any]) -> str | None:
+        reset_at = window.get("reset_at")
+        if reset_at is None:
+            reset_after_seconds = window.get("reset_after_seconds")
+            if reset_after_seconds is None:
+                return None
+            try:
+                reset_at = time.time() + float(reset_after_seconds)
+            except (TypeError, ValueError):
+                reset_at = None
+        try:
+            timestamp = float(reset_at)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _codex_window_remaining(window: Dict[str, Any]) -> int | None:
+        try:
+            used_percent = float(window.get("used_percent"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(used_percent):
+            return None
+        remaining = max(0.0, 100.0 - used_percent)
+        if 0 < remaining < 1:
+            return 1
+        return int(remaining)
+
+    @staticmethod
+    def _codex_remaining_percent(value: object) -> int | None:
+        try:
+            remaining = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(remaining):
+            return None
+        return max(0, min(100, int(remaining)))
+
+    @staticmethod
+    def _codex_limit_blocked(limit: object) -> bool:
+        if not isinstance(limit, dict):
+            return False
+        return limit.get("limit_reached") is True or limit.get("allowed") is False
+
+    @staticmethod
+    def _codex_reached_type(usage: Dict[str, Any]) -> str:
+        value = usage.get("rate_limit_reached_type")
+        if isinstance(value, dict):
+            value = value.get("type")
+        normalized = str(value or "").strip().lower()
+        known_blocking_types = {
+            "rate_limit_reached",
+            "workspace_owner_credits_depleted",
+            "workspace_member_credits_depleted",
+            "workspace_owner_usage_limit_reached",
+            "workspace_member_usage_limit_reached",
+        }
+        return normalized if normalized in known_blocking_types else ""
+
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
-        try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
-        except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
+        # curl_cffi requests.Session uses a thread-local Curl handle by default.
+        # Running these requests in child threads and then closing the backend in
+        # the caller thread leaves those child handles (and their connections)
+        # outside Session.close(). Keep all three requests on this thread so the
+        # backend's normal close() path owns every Curl handle it created.
+        me_payload = self._get_me()
+        init_payload = self._get_conversation_init()
+        default_account = self._get_default_account()
 
         plan_type = str(default_account.get("plan_type") or "free")
 
@@ -366,6 +459,148 @@ class OpenAIBackendAPI:
             "type": result.get("type"),
             "quota": result.get("quota"),
             "default_model_slug": result.get("default_model_slug"),
+            "restore_at": result.get("restore_at"),
+            "status": result.get("status"),
+        })
+        return result
+
+    def get_codex_user_info(self) -> Dict[str, Any]:
+        """Fetch source-appropriate account status for a Codex OAuth token."""
+        if not self.access_token:
+            raise RuntimeError("access_token is required")
+
+        usage = self._get_codex_usage()
+        rate_limit = usage.get("rate_limit")
+        rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
+        base_limit_entries: list[tuple[str, Dict[str, Any]]] = []
+        if rate_limit:
+            base_limit_entries.append(("codex", rate_limit))
+        additional_limit_entries: list[tuple[str, Dict[str, Any]]] = []
+        additional_rate_limits = usage.get("additional_rate_limits")
+        additional_rate_limits = additional_rate_limits if isinstance(additional_rate_limits, list) else []
+        for index, item in enumerate(additional_rate_limits):
+            if not isinstance(item, dict) or not isinstance(item.get("rate_limit"), dict):
+                continue
+            limit_name = str(
+                item.get("limit_name") or item.get("metered_feature") or f"additional_{index + 1}"
+            ).strip()
+            additional_limit_entries.append((limit_name or f"additional_{index + 1}", item["rate_limit"]))
+
+        base_window_entries = [
+            (limit_name, window_name, window)
+            for limit_name, limit in base_limit_entries
+            for window_name in ("primary", "secondary")
+            if isinstance((window := limit.get(f"{window_name}_window")), dict)
+        ]
+        additional_window_entries = [
+            (limit_name, window_name, window)
+            for limit_name, limit in additional_limit_entries
+            for window_name in ("primary", "secondary")
+            if isinstance((window := limit.get(f"{window_name}_window")), dict)
+        ]
+        window_entries = [*base_window_entries, *additional_window_entries]
+        base_remaining_values = [
+            remaining
+            for _, _, window in base_window_entries
+            if (remaining := self._codex_window_remaining(window)) is not None
+        ]
+        base_window_states = [
+            (self._codex_window_remaining(window), self._codex_reset_iso(window))
+            for _, _, window in base_window_entries
+        ]
+
+        spend_control = usage.get("spend_control")
+        spend_control = spend_control if isinstance(spend_control, dict) else {}
+        individual_limit = spend_control.get("individual_limit")
+        individual_limit = individual_limit if isinstance(individual_limit, dict) else {}
+        individual_remaining = self._codex_remaining_percent(individual_limit.get("remaining_percent"))
+        individual_restore_at = self._codex_reset_iso(individual_limit) if individual_limit else None
+        reached_type = self._codex_reached_type(usage)
+        base_limit_reached = self._codex_limit_blocked(rate_limit)
+        spend_control_reached = spend_control.get("reached") is True or self._codex_limit_blocked(spend_control)
+        limit_reached = base_limit_reached or spend_control_reached or bool(reached_type)
+
+        global_remaining_values = [
+            *base_remaining_values,
+            *([individual_remaining] if individual_remaining is not None else []),
+        ]
+        codex_remaining_percent = min(global_remaining_values) if global_remaining_values else None
+        base_restore_candidates = [
+            value
+            for _, _, window in base_window_entries
+            if (value := self._codex_reset_iso(window)) is not None
+        ]
+        base_bottleneck = min(base_remaining_values) if base_remaining_values else None
+        base_bottleneck_restore_candidates = [
+            reset_at
+            for remaining, reset_at in base_window_states
+            if remaining == base_bottleneck and reset_at is not None
+        ]
+        if limit_reached:
+            restore_candidates = []
+            if base_limit_reached or reached_type:
+                restore_candidates.extend(base_bottleneck_restore_candidates or base_restore_candidates)
+            if (spend_control_reached or reached_type) and individual_restore_at:
+                restore_candidates.append(individual_restore_at)
+            restore_at = max(restore_candidates) if restore_candidates else None
+        else:
+            restore_candidates = [
+                reset_at
+                for remaining, reset_at in [
+                    *base_window_states,
+                    (individual_remaining, individual_restore_at),
+                ]
+                if remaining == codex_remaining_percent and reset_at is not None
+            ]
+            restore_at = max(restore_candidates) if restore_candidates else None
+
+        token_payload = account_service._decode_jwt_payload(self.access_token)
+        auth_claim = token_payload.get("https://api.openai.com/auth")
+        auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
+        profile_claim = token_payload.get("https://api.openai.com/profile")
+        profile_claim = profile_claim if isinstance(profile_claim, dict) else {}
+        plan_type = str(
+            usage.get("plan_type")
+            or auth_claim.get("chatgpt_plan_type")
+            or self.account.get("type")
+            or "free"
+        )
+        limits_progress = [
+            {
+                "feature_name": f"{limit_name}_{window_name}",
+                "remaining": self._codex_window_remaining(window),
+                "reset_after": self._codex_reset_iso(window),
+            }
+            for limit_name, window_name, window in window_entries
+        ]
+        if individual_limit:
+            limits_progress.append({
+                "feature_name": "codex_spend_control",
+                "remaining": individual_remaining,
+                "reset_after": individual_restore_at,
+            })
+        result = {
+            "email": profile_claim.get("email") or self.account.get("email"),
+            "account_id": self._codex_account_id() or self.account.get("account_id"),
+            "type": plan_type,
+            "codex_available": not limit_reached,
+            "codex_remaining_percent": codex_remaining_percent,
+            "image_quota_unknown": True,
+            "limits_progress": limits_progress,
+            "restore_at": restore_at,
+            "status": "限流" if limit_reached else "正常",
+            "codex_rate_limit": rate_limit,
+            "codex_additional_rate_limits": additional_rate_limits,
+            "codex_spend_control": spend_control,
+            "codex_rate_limit_reached_type": reached_type or None,
+        }
+        logger.debug({
+            "event": "codex_user_info_result",
+            "email": result.get("email"),
+            "account_id": result.get("account_id"),
+            "type": result.get("type"),
+            "codex_available": result.get("codex_available"),
+            "codex_remaining_percent": result.get("codex_remaining_percent"),
             "restore_at": result.get("restore_at"),
             "status": result.get("status"),
         })
