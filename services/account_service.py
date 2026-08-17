@@ -151,6 +151,8 @@ class AccountService:
             return False
         if cls._normalize_source_type(account.get("source_type")) == "codex":
             codex_available = account.get("codex_available")
+            if not account.get("image_quota_unknown") and int(account.get("quota") or 0) <= 0:
+                return False
             if codex_available is not None:
                 return bool(codex_available)
         return int(account.get("quota") or 0) > 0
@@ -269,7 +271,12 @@ class AccountService:
         if not source_type and str(normalized.get("export_type") or "").strip().lower() == "codex":
             source_type = "codex"
         normalized["source_type"] = self._normalize_source_type(source_type)
-        normalized["image_quota_unknown"] = normalized["source_type"] == "codex"
+        if normalized["source_type"] == "codex":
+            # codex 账号的图片额度默认未知；刷新成功拿到 image_gen 数字额度后变为已知
+            image_quota_unknown = self._normalize_optional_bool(normalized.get("image_quota_unknown"))
+            normalized["image_quota_unknown"] = True if image_quota_unknown is None else image_quota_unknown
+        else:
+            normalized["image_quota_unknown"] = False
         limits_progress = normalized.get("limits_progress")
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None

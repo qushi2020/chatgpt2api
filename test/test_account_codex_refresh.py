@@ -86,6 +86,13 @@ class FakeUsageSession:
 
 
 class CodexAccountRefreshTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # 默认 codex 图片额度未知；需要覆盖的测试在方法内自行 patch 实例属性
+        self._orig_get_codex_image_quota = OpenAIBackendAPI._get_codex_image_quota
+        patcher = patch.object(OpenAIBackendAPI, "_get_codex_image_quota", return_value=(0, True))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_codex_availability_normalizes_string_booleans(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
@@ -305,7 +312,7 @@ class CodexAccountRefreshTests(unittest.TestCase):
         self.assertTrue(result["codex_available"])
         self.assertEqual(result["codex_remaining_percent"], 60)
         self.assertTrue(result["image_quota_unknown"])
-        self.assertNotIn("quota", result)
+        self.assertEqual(result["quota"], 0)
         self.assertEqual(len(result["limits_progress"]), 2)
         self.assertEqual(result["restore_at"], "2027-01-16T11:46:40+00:00")
 
@@ -355,8 +362,65 @@ class CodexAccountRefreshTests(unittest.TestCase):
         self.assertEqual(result["status"], "限流")
         self.assertFalse(result["codex_available"])
         self.assertEqual(result["codex_remaining_percent"], 0)
-        self.assertNotIn("quota", result)
+        self.assertEqual(result["quota"], 0)
         self.assertEqual(result["restore_at"], "2027-01-16T11:46:40+00:00")
+
+    def test_codex_user_info_includes_numeric_image_quota_when_available(self) -> None:
+        backend = OpenAIBackendAPI(make_jwt({"https://api.openai.com/profile": {"email": "codex@example.com"}}))
+        backend.account = {"source_type": "codex", "type": "free"}
+        try:
+            with (
+                patch.object(
+                    backend,
+                    "_get_codex_usage",
+                    return_value={
+                        "plan_type": "free",
+                        "rate_limit": {
+                            "allowed": True,
+                            "limit_reached": False,
+                            "primary_window": {"used_percent": 0, "reset_at": 1_800_000_000},
+                        },
+                    },
+                ),
+                patch.object(backend, "_get_codex_image_quota", return_value=(7, False)),
+            ):
+                result = backend.get_codex_user_info()
+        finally:
+            backend.close()
+
+        self.assertEqual(result["quota"], 7)
+        self.assertFalse(result["image_quota_unknown"])
+
+    def test_codex_image_quota_unknown_when_conversation_init_fails(self) -> None:
+        backend = OpenAIBackendAPI("opaque-token")
+        try:
+            with patch.object(backend, "_get_conversation_init", side_effect=RuntimeError("boom")):
+                # 绕过 setUp 的类级 patch，验证真实 helper 的降级行为
+                quota, unknown = self._orig_get_codex_image_quota(backend)
+        finally:
+            backend.close()
+
+        self.assertEqual(quota, 0)
+        self.assertTrue(unknown)
+
+    def test_codex_image_quota_extracted_from_limits_progress(self) -> None:
+        backend = OpenAIBackendAPI("opaque-token")
+        try:
+            with patch.object(
+                backend,
+                "_get_conversation_init",
+                return_value={
+                    "limits_progress": [
+                        {"feature_name": "image_gen", "remaining": 12, "reset_after": "2026-08-18"},
+                    ]
+                },
+            ):
+                quota, unknown = self._orig_get_codex_image_quota(backend)
+        finally:
+            backend.close()
+
+        self.assertEqual(quota, 12)
+        self.assertFalse(unknown)
 
     def test_codex_usage_uses_current_wham_route(self) -> None:
         backend = OpenAIBackendAPI("opaque-token")

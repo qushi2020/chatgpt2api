@@ -804,7 +804,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             # 外层传入的 backend（由 text_backend() / MessageRequest 等专门为本调用创建）
             # 同样必须关闭，否则其 curl_cffi Session 及到上游 443 的 keepalive 连接会
             # 因 GC 不可靠而长期滞留成 CLOSE-WAIT，进而造成内存泄漏。
-            backend.close()
+            close_backend = getattr(backend, "close", None)
+            if callable(close_backend):
+                close_backend()
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:

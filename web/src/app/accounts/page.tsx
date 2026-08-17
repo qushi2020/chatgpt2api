@@ -109,15 +109,15 @@ function formatQuota(account: Account) {
   if (requiresReauth(account)) {
     return "—";
   }
+  if (!account.image_quota_unknown) {
+    return String(Math.max(0, account.quota));
+  }
   if (account.source_type === "codex") {
     return typeof account.codex_remaining_percent === "number"
       ? `${Math.max(0, Math.min(100, account.codex_remaining_percent))}%`
       : "—";
   }
-  if (account.image_quota_unknown) {
-    return "—";
-  }
-  return String(Math.max(0, account.quota));
+  return "—";
 }
 
 function formatRestoreAt(value?: string | null) {

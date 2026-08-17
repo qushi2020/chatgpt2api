@@ -83,8 +83,9 @@ class AccountCapabilityTests(unittest.TestCase):
         try:
             config.data["web_image_model_slug"] = "gpt-5-6-free"
             backend.account = {"type": "free", "default_model_slug": "gpt-5-3"}
-            self.assertEqual(backend._image_model_slug("gpt-image-2"), "gpt-5-6-free")
-            self.assertEqual(backend._image_model_slug("pro-" + "gpt-image-2"), "auto")
+            upstream_model, _ = backend._image_model_settings("gpt-image-2")
+            self.assertEqual(upstream_model, "gpt-5-6-free")
+            self.assertEqual(backend._image_model_settings("pro-" + "gpt-image-2"), ("auto", ""))
         finally:
             if original_value is None:
                 config.data.pop("web_image_model_slug", None)

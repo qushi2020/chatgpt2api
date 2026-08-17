@@ -483,6 +483,7 @@ class OpenAIBackendAPI:
             raise RuntimeError("access_token is required")
 
         usage = self._get_codex_usage()
+        image_quota, image_quota_unknown = self._get_codex_image_quota()
         rate_limit = usage.get("rate_limit")
         rate_limit = rate_limit if isinstance(rate_limit, dict) else {}
         base_limit_entries: list[tuple[str, Dict[str, Any]]] = []
@@ -598,7 +599,8 @@ class OpenAIBackendAPI:
             "type": plan_type,
             "codex_available": not limit_reached,
             "codex_remaining_percent": codex_remaining_percent,
-            "image_quota_unknown": True,
+            "quota": image_quota,
+            "image_quota_unknown": image_quota_unknown,
             "limits_progress": limits_progress,
             "restore_at": restore_at,
             "status": "限流" if limit_reached else "正常",
@@ -614,10 +616,32 @@ class OpenAIBackendAPI:
             "type": result.get("type"),
             "codex_available": result.get("codex_available"),
             "codex_remaining_percent": result.get("codex_remaining_percent"),
+            "quota": result.get("quota"),
+            "image_quota_unknown": result.get("image_quota_unknown"),
             "restore_at": result.get("restore_at"),
             "status": result.get("status"),
         })
         return result
+
+    def _get_codex_image_quota(self) -> tuple[int, bool]:
+        """尽力获取 codex 账号的图片数字额度（image_gen remaining）。
+
+        codex OAuth token 同样可以调用 conversation/init，CodexManager 就是这样
+        拿到图片剩余张数的。失败时保持额度未知，不影响 codex 限流状态本身。
+        """
+        try:
+            init_payload = self._get_conversation_init()
+        except Exception as exc:
+            logger.debug({"event": "codex_image_quota_fetch_failed", "error": str(exc)})
+            return 0, True
+        limits_progress = init_payload.get("limits_progress")
+        limits_progress = limits_progress if isinstance(limits_progress, list) else []
+        quota, _ = self._extract_quota_and_restore_at(limits_progress)
+        unknown = not any(
+            isinstance(item, dict) and item.get("feature_name") == "image_gen"
+            for item in limits_progress
+        )
+        return quota, unknown
 
     def _bootstrap_headers(self) -> Dict[str, str]:
         """构造首页预热请求头。"""
