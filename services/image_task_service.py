@@ -56,7 +56,9 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     for item in data:
         if isinstance(item, dict):
             url = item.get("url")
-            if isinstance(url, str) and url:
+            # data: URI 是内联图片载荷（关闭图片保存时单条可达数 MB），
+            # 写进日志会把记录撑到 MB 级，这里跳过。
+            if isinstance(url, str) and url and not url.startswith("data:"):
                 urls.append(url)
     return urls
 
@@ -77,6 +79,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["conversation_id"] = task.get("conversation_id")
     if task.get("data") is not None:
         item["data"] = task.get("data")
+    elif task.get("payload_expired"):
+        item["payload_expired"] = True
     if task.get("usage") is not None:
         item["usage"] = task.get("usage")
     if task.get("error"):
@@ -98,6 +102,13 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 class ImageTaskService:
+    # 终态任务的结果载荷（data 数组，关闭图片保存时是数 MB 的 data: URI）
+    # 只在 TTL 内保留供客户端轮询取图，过期后从持久化中剥离，防止
+    # image_tasks.json 无限膨胀（2026-09 实测 7 个任务占 21MB）。
+    PAYLOAD_TTL_SECS = 3600.0
+    MAX_STORED_TASKS = 2000
+    ERROR_TEXT_MAX_CHARS = 2000
+
     def __init__(
         self,
         path: Path,
@@ -105,11 +116,15 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
+        payload_ttl_secs: float = PAYLOAD_TTL_SECS,
+        max_tasks: int = MAX_STORED_TASKS,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
+        self.payload_ttl_secs = max(60.0, float(payload_ttl_secs))
+        self.max_tasks = max(10, int(max_tasks))
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -421,10 +436,14 @@ class ImageTaskService:
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error
+            if item.get("payload_expired"):
+                task["payload_expired"] = True
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
     def _save_locked(self) -> None:
+        # 落盘前先做过期剥离，保证磁盘文件不携带已过 TTL 的结果载荷。
+        self._expire_task_payloads_locked()
         items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -442,6 +461,7 @@ class ImageTaskService:
         return changed
 
     def _cleanup_locked(self) -> bool:
+        changed = self._expire_task_payloads_locked()
         try:
             retention_days = max(1, int(self.retention_days_getter()))
         except Exception:
@@ -454,7 +474,45 @@ class ImageTaskService:
         ]
         for key in removed_keys:
             self._tasks.pop(key, None)
-        return bool(removed_keys)
+        if removed_keys:
+            changed = True
+        # 数量兜底：即便都在保留期内，终态任务也不超过 max_tasks，
+        # 优先淘汰 updated_at 最旧的终态任务，未完成任务不受影响。
+        terminal_keys = [
+            key for key, task in self._tasks.items() if task.get("status") in TERMINAL_STATUSES
+        ]
+        overflow = len(self._tasks) - self.max_tasks
+        if overflow > 0 and len(terminal_keys) > 0:
+            terminal_keys.sort(key=lambda key: _timestamp(self._tasks[key].get("updated_at")))
+            for key in terminal_keys[:overflow]:
+                self._tasks.pop(key, None)
+            changed = True
+        return changed
+
+    def _expire_task_payloads_locked(self) -> bool:
+        """终态任务超过 TTL 后剥离结果载荷并截断超长错误文本。
+
+        轮询客户端在任务完成后的秒级窗口内取图，TTL（默认 1 小时）远大于该窗口；
+        过期后 data 不再持久化，image_tasks.json 体积与任务数成正比而不是与图片字节成正比。
+        """
+        now = time.time()
+        changed = False
+        for task in self._tasks.values():
+            if task.get("status") not in TERMINAL_STATUSES or task.get("payload_expired"):
+                continue
+            updated_ts = task.get("updated_ts")
+            if not isinstance(updated_ts, (int, float)) or updated_ts <= 0:
+                updated_ts = _timestamp(task.get("updated_at"))
+            if now - float(updated_ts) < self.payload_ttl_secs:
+                continue
+            if task.pop("data", None) is not None:
+                task["payload_expired"] = True
+                changed = True
+            error = _clean(task.get("error"))
+            if len(error) > self.ERROR_TEXT_MAX_CHARS:
+                task["error"] = error[: self.ERROR_TEXT_MAX_CHARS - 1] + "…"
+                changed = True
+        return changed
 
     def resume_poll(
         self,

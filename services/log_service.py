@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import os
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,20 +19,55 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from services.config import DATA_DIR
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
+from utils.log import logger
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
 
+# 单条日志序列化后的硬上限与字段截断长度：防止 data: URI 等巨型内容
+# 把 logs.jsonl 撑到百 MB 级（2026-09 实测单条 7.2MB 导致日志页 6.8s 才返回）。
+LOG_MAX_LINE_BYTES = 256 * 1024
+LOG_DETAIL_STRING_LIMIT = 2000
+# list() 从文件尾部反向扫描的最多字节数；更大的文件只看最近这段。
+LOG_MAX_SCAN_BYTES = 64 * 1024 * 1024
+# 自动瘦身：追加时若文件超过阈值，仅保留尾部内容，避免长期运行无限膨胀。
+LOG_ROTATE_THRESHOLD_BYTES = 64 * 1024 * 1024
+LOG_ROTATE_KEEP_BYTES = 16 * 1024 * 1024
+LOG_ROTATE_CHECK_INTERVAL_SECS = 3600.0
+LOG_READ_BLOCK_BYTES = 1024 * 1024
+
 
 class LogService:
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_line_bytes: int = LOG_MAX_LINE_BYTES,
+        detail_string_limit: int = LOG_DETAIL_STRING_LIMIT,
+        max_scan_bytes: int = LOG_MAX_SCAN_BYTES,
+        rotate_threshold_bytes: int = LOG_ROTATE_THRESHOLD_BYTES,
+        rotate_keep_bytes: int = LOG_ROTATE_KEEP_BYTES,
+        rotate_check_interval_secs: float = LOG_ROTATE_CHECK_INTERVAL_SECS,
+        read_block_bytes: int = LOG_READ_BLOCK_BYTES,
+    ):
         self.path = path
+        self.max_line_bytes = max(1024, int(max_line_bytes))
+        self.detail_string_limit = max(64, int(detail_string_limit))
+        self.max_scan_bytes = max(1024, int(max_scan_bytes))
+        self.rotate_threshold_bytes = max(1024, int(rotate_threshold_bytes))
+        self.rotate_keep_bytes = max(1024, int(rotate_keep_bytes))
+        self.rotate_check_interval_secs = max(0.0, float(rotate_check_interval_secs))
+        self.read_block_bytes = max(64, int(read_block_bytes))
+        self._io_lock = threading.Lock()
+        self._last_rotate_check = 0.0
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
-        payload = f"{line_number}:{raw_line}".encode("utf-8", errors="ignore")
+        # 旧格式行（无 id 字段）用内容哈希生成稳定 id：与行号无关，
+        # 文件追加/瘦身后 id 保持不变，便于后台按 id 删除。
+        payload = raw_line.encode("utf-8", errors="ignore")
         return hashlib.sha1(payload).hexdigest()[:24]
 
     def _parse_line(self, raw_line: str, line_number: int) -> dict[str, Any] | None:
@@ -48,6 +85,16 @@ class LogService:
     def _serialize_item(item: dict[str, Any]) -> str:
         return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
 
+    @classmethod
+    def _truncate_deep(cls, value: Any, limit: int) -> Any:
+        if isinstance(value, str):
+            return value if len(value) <= limit else value[: limit - 1] + "…"
+        if isinstance(value, dict):
+            return {key: cls._truncate_deep(item, limit) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._truncate_deep(item, limit) for item in value]
+        return value
+
     @staticmethod
     def _matches_filters(item: dict[str, Any], *, type: str = "", start_date: str = "", end_date: str = "") -> bool:
         t = str(item.get("time") or "")
@@ -60,6 +107,19 @@ class LogService:
             return False
         return True
 
+    def _serialize_capped(self, item: dict[str, Any]) -> str:
+        line = self._serialize_item(item)
+        if len(line.encode("utf-8")) <= self.max_line_bytes:
+            return line
+        trimmed = dict(item)
+        trimmed["detail"] = self._truncate_deep(trimmed.get("detail"), self.detail_string_limit)
+        trimmed["detail_truncated"] = True
+        line = self._serialize_item(trimmed)
+        if len(line.encode("utf-8")) <= self.max_line_bytes:
+            return line
+        trimmed["detail"] = {"truncated": True, "reason": "detail exceeds log line cap"}
+        return self._serialize_item(trimmed)
+
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
         item = {
             "id": uuid4().hex,
@@ -68,45 +128,101 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
+        line = self._serialize_capped(item)
+        with self._io_lock:
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(line + "\n")
+            self._rotate_if_needed_locked()
+
+    def _rotate_if_needed_locked(self) -> None:
+        now = time.monotonic()
+        if now - self._last_rotate_check < self.rotate_check_interval_secs:
+            return
+        self._last_rotate_check = now
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return
+        if size <= self.rotate_threshold_bytes:
+            return
+        keep = min(self.rotate_keep_bytes, size)
+        with self.path.open("rb") as file:
+            file.seek(size - keep)
+            tail = file.read(keep)
+        # 丢弃首个不完整行，从完整行开始保留
+        newline_index = tail.find(b"\n")
+        if newline_index >= 0:
+            tail = tail[newline_index + 1:]
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_bytes(tail)
+        os.replace(tmp_path, self.path)
+        logger.info({
+            "event": "log_file_rotated",
+            "path": str(self.path),
+            "previous_size": size,
+            "kept_bytes": len(tail),
+        })
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        if limit <= 0:
+            return []
+        try:
+            file_size = self.path.stat().st_size
+        except OSError:
             return []
         items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
-            if item is None:
-                continue
-            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
-                continue
-            items.append(item)
+        scan_floor = max(0, file_size - self.max_scan_bytes)
+
+        def _handle_line(raw_line: str) -> None:
             if len(items) >= limit:
-                break
+                return
+            item = self._parse_line(raw_line, 0)
+            if item is None:
+                return
+            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
+                return
+            items.append(item)
+
+        with self._io_lock:
+            with self.path.open("rb") as file:
+                position = file_size
+                carry = b""
+                while position > scan_floor and len(items) < limit:
+                    block_size = min(self.read_block_bytes, position - scan_floor)
+                    position -= block_size
+                    file.seek(position)
+                    block = file.read(block_size) + carry
+                    pieces = block.split(b"\n")
+                    # pieces[0] 可能是残行（起点在更早的块里），留给下一轮拼接
+                    carry = pieces[0]
+                    complete = pieces[1:] if position > scan_floor else pieces
+                    for raw_bytes in reversed(complete):
+                        raw_line = raw_bytes.decode("utf-8", errors="ignore").strip()
+                        if raw_line:
+                            _handle_line(raw_line)
         return items
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
         if not self.path.exists() or not target_ids:
             return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
-        removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
+        with self._io_lock:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+            kept_lines: list[str] = []
+            removed = 0
+            for line_number, raw_line in enumerate(lines):
+                item = self._parse_line(raw_line, line_number)
+                if item is None:
+                    kept_lines.append(raw_line)
+                    continue
+                if str(item.get("id") or "") in target_ids:
+                    removed += 1
+                    continue
+                kept_lines.append(self._serialize_item(item))
+            content = "\n".join(kept_lines)
+            if content:
+                content += "\n"
+            self.path.write_text(content, encoding="utf-8")
         return {"removed": removed}
 
 
@@ -118,9 +234,12 @@ def _collect_urls(value: object) -> list[str]:
     if isinstance(value, dict):
         for key, item in value.items():
             if key == "url" and isinstance(item, str):
-                urls.append(item)
+                # data: URI 是内联图片载荷（关闭图片保存时可达数 MB），不属于 URL，
+                # 收进日志会把单条记录撑到 MB 级，这里直接跳过。
+                if not item.startswith("data:"):
+                    urls.append(item)
             elif key == "urls" and isinstance(item, list):
-                urls.extend(str(url) for url in item if isinstance(url, str))
+                urls.extend(str(url) for url in item if isinstance(url, str) and not str(url).startswith("data:"))
             else:
                 urls.extend(_collect_urls(item))
     elif isinstance(value, list):
