@@ -61,7 +61,7 @@ class BackupDeleteRequest(BaseModel):
 
 
 def free_web_image_model_slug_options() -> dict[str, object]:
-    """Return ChatGPT model slugs available to free web accounts for gpt-image-2 mapping."""
+    """Return ChatGPT model slugs available to free web accounts for gpt-image-2 / gpt-image-2.5 mapping."""
     fallback_slugs = {WEB_IMAGE_DEFAULT_MODEL_SLUG, config.web_image_model_slug}
     accounts = [
         item

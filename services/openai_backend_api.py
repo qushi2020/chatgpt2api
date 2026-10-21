@@ -24,7 +24,17 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import SseIdleTimeoutError, UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import (
+    CODEX_IMAGE_MODEL,
+    CODEX_IMAGE_TOOL_MODELS,
+    SseIdleTimeoutError,
+    UpstreamHTTPError,
+    WEB_IMAGE_MODELS,
+    ensure_ok,
+    iter_sse_payloads,
+    new_uuid,
+    split_image_model,
+)
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -74,7 +84,6 @@ class ChatRequirements:
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
-CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
@@ -834,9 +843,11 @@ class OpenAIBackendAPI:
         _, base_model = split_image_model(model)
         if not base_model:
             return "auto", ""
-        if base_model == "gpt-image-2":
+        if base_model in WEB_IMAGE_MODELS:
+            # gpt-image-2 / gpt-image-2.5 的网页生图版本由服务端决定，
+            # 这里映射为底层 ChatGPT 聊天模型 slug。
             upstream_model = config.web_image_model_slug
-        elif base_model == CODEX_IMAGE_MODEL:
+        elif base_model in CODEX_IMAGE_TOOL_MODELS:
             upstream_model = base_model
         else:
             return "auto", ""
@@ -1057,10 +1068,19 @@ class OpenAIBackendAPI:
             images: list[str] | None = None,
             size: str | None = None,
             quality: str = "auto",
+            model: str = "",
     ) -> Iterator[Dict[str, Any]]:
         if not self.access_token:
             raise RuntimeError("access_token is required for codex image endpoints")
         self._ensure_codex_source_account()
+        _, base_model = split_image_model(model) if model else (None, "")
+        tool_model = CODEX_IMAGE_TOOL_MODELS.get(base_model or "", CODEX_IMAGE_TOOL_MODELS[CODEX_IMAGE_MODEL])
+        if model and base_model not in CODEX_IMAGE_TOOL_MODELS:
+            logger.warning({
+                "event": "codex_image_tool_model_fallback",
+                "requested_model": str(model),
+                "fallback_tool_model": tool_model,
+            })
         path = "/backend-api/codex/responses"
         payload = {
             "model": CODEX_RESPONSES_MODEL,
@@ -1069,7 +1089,7 @@ class OpenAIBackendAPI:
             "input": self._codex_image_input(prompt, images or []),
             "tools": [{
                 "type": "image_generation",
-                "model": "gpt-image-2",
+                "model": tool_model,
                 "action": "edit" if images else "generate",
                 "size": str(size or "1024x1024"),
                 "quality": str(quality or "auto"),

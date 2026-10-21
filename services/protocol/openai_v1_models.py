@@ -4,10 +4,14 @@ from typing import Any
 
 from services.account_service import account_service
 from services.model_service import model_catalog_service
-from utils.helper import CODEX_IMAGE_MODEL
-
-
-WEB_IMAGE_MODEL = "gpt-image-2"
+from utils.helper import (
+    CODEX_IMAGE_25_MODEL,
+    CODEX_IMAGE_25_SUNBURST_MODEL,
+    CODEX_IMAGE_MODEL,
+    IMAGE_MODEL_PLAN_TYPES,
+    WEB_IMAGE_25_MODEL,
+    WEB_IMAGE_MODEL,
+)
 
 
 def list_models() -> dict[str, Any]:
@@ -34,15 +38,14 @@ def list_models() -> dict[str, Any]:
     }
 
     if web_types:
-        dynamic_models.add(WEB_IMAGE_MODEL)
-    if codex_types & {"Plus", "Team", "Pro"}:
-        dynamic_models.add(CODEX_IMAGE_MODEL)
-    if "Plus" in codex_types:
-        dynamic_models.add(f"plus-{CODEX_IMAGE_MODEL}")
-    if "Team" in codex_types:
-        dynamic_models.add(f"team-{CODEX_IMAGE_MODEL}")
-    if "Pro" in codex_types:
-        dynamic_models.add(f"pro-{CODEX_IMAGE_MODEL}")
+        dynamic_models.update({WEB_IMAGE_MODEL, WEB_IMAGE_25_MODEL})
+    codex_base_models = (CODEX_IMAGE_MODEL, CODEX_IMAGE_25_MODEL, CODEX_IMAGE_25_SUNBURST_MODEL)
+    codex_types_lower = {value.lower() for value in codex_types}
+    if codex_types_lower & {"plus", "team", "pro"}:
+        dynamic_models.update(codex_base_models)
+    for plan_type in IMAGE_MODEL_PLAN_TYPES:
+        if plan_type in codex_types_lower:
+            dynamic_models.update(f"{plan_type}-{model}" for model in codex_base_models)
 
     for model in sorted(dynamic_models):
         if model not in seen:

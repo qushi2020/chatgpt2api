@@ -430,7 +430,7 @@ class ConfigStore:
 
     @property
     def web_image_model_slug(self) -> str:
-        """底层 ChatGPT 网页生图模型 slug，用于无前缀 gpt-image-2。"""
+        """底层 ChatGPT 网页生图模型 slug，用于无前缀 gpt-image-2 / gpt-image-2.5。"""
         return _normalize_model_slug(self.data.get("web_image_model_slug"), WEB_IMAGE_DEFAULT_MODEL_SLUG)
 
     @property

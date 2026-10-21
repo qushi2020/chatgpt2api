@@ -1324,6 +1324,7 @@ def stream_codex_image_outputs(
         images=request.images or [],
         size=request.size,
         quality=request.quality,
+        model=request.model,
     )))
     if not images:
         raise ImageGenerationError("No image result found in response")

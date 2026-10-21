@@ -17,12 +17,25 @@ from services.proxy_service import proxy_settings
 from utils.log import logger
 
 WEB_IMAGE_MODEL = "gpt-image-2"
+WEB_IMAGE_25_MODEL = "gpt-image-2.5"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
-BASE_IMAGE_MODELS = {WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL}
+CODEX_IMAGE_25_MODEL = "codex-gpt-image-2.5"
+CODEX_IMAGE_25_SUNBURST_MODEL = "codex-gpt-image-2.5-sunburst"
+# Codex 图片别名 -> /backend-api/codex/responses 中 image_generation 工具的上游模型。
+# 官方 API 于 2026-09-08 发布 gpt-image-2.5-flare（快速）/ gpt-image-2.5-sunburst（高精度）。
+CODEX_IMAGE_TOOL_MODELS = {
+    CODEX_IMAGE_MODEL: "gpt-image-2",
+    CODEX_IMAGE_25_MODEL: "gpt-image-2.5-flare",
+    CODEX_IMAGE_25_SUNBURST_MODEL: "gpt-image-2.5-sunburst",
+}
+WEB_IMAGE_MODELS = {WEB_IMAGE_MODEL, WEB_IMAGE_25_MODEL}
+CODEX_IMAGE_MODEL_ALIASES = set(CODEX_IMAGE_TOOL_MODELS)
+BASE_IMAGE_MODELS = WEB_IMAGE_MODELS | CODEX_IMAGE_MODEL_ALIASES
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 PREFIXED_CODEX_IMAGE_MODELS = {
-    f"{plan_type}-{CODEX_IMAGE_MODEL}"
+    f"{plan_type}-{codex_model}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES
+    for codex_model in CODEX_IMAGE_MODEL_ALIASES
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = IMAGE_MODELS
@@ -120,9 +133,9 @@ def split_image_model(model: object) -> tuple[str | None, str | None]:
     if normalized in BASE_IMAGE_MODELS:
         return None, normalized
     for plan_type in IMAGE_MODEL_PLAN_TYPES:
-        prefixed_codex = f"{plan_type}-{CODEX_IMAGE_MODEL}"
-        if normalized == prefixed_codex:
-            return plan_type, CODEX_IMAGE_MODEL
+        for codex_model in CODEX_IMAGE_MODEL_ALIASES:
+            if normalized == f"{plan_type}-{codex_model}":
+                return plan_type, codex_model
     return None, None
 
 
@@ -133,7 +146,7 @@ def is_supported_image_model(model: object) -> bool:
 
 def is_codex_image_model(model: object) -> bool:
     _, base_model = split_image_model(model)
-    return base_model == CODEX_IMAGE_MODEL
+    return base_model in CODEX_IMAGE_MODEL_ALIASES
 
 
 def is_image_chat_request(body: dict[str, object]) -> bool:

@@ -173,7 +173,7 @@ export function ConfigCard() {
               placeholder="gpt-5-5"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">gpt-image-2 发起图片请求时使用的上游模型名称，默认 gpt-5-5。</p>
+            <p className="text-xs text-stone-500">gpt-image-2 / gpt-image-2.5 发起图片请求时使用的上游模型名称，默认 gpt-5-5。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">默认思考强度</label>
@@ -214,7 +214,7 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">gpt-image-2 底层模型</label>
+            <label className="text-sm text-stone-700">gpt-image-2 / gpt-image-2.5 底层模型</label>
             <div className="flex gap-2">
               <Select
                 value={String(config?.web_image_model_slug || "gpt-5-3")}
@@ -240,7 +240,7 @@ export function ConfigCard() {
                 <RefreshCw className={`size-4 ${isLoadingFreeWebImageModelSlugs ? "animate-spin" : ""}`} />
               </Button>
             </div>
-            <p className="text-xs text-stone-500">用于无前缀 gpt-image-2；选项来自当前免费 web 账号可用模型。</p>
+            <p className="text-xs text-stone-500">用于无前缀 gpt-image-2 / gpt-image-2.5；选项来自当前免费 web 账号可用模型。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片推理强度</label>
@@ -257,7 +257,7 @@ export function ConfigCard() {
                 ))}
               </SelectContent>
             </Select>
-            <p className="text-xs text-stone-500">用于 gpt-image-2 图片生成和图片编辑请求的 thinking_effort。</p>
+            <p className="text-xs text-stone-500">用于 gpt-image-2 / gpt-image-2.5 图片生成和图片编辑请求的 thinking_effort。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>

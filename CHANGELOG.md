@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [新增] 支持 GPT Image 2.5（官方 2026-09-08 发布）：新增 `gpt-image-2.5`（网页链路）、`codex-gpt-image-2.5`（对应官方 `gpt-image-2.5-flare`，快速日常出图）与 `codex-gpt-image-2.5-sunburst`（高精度编辑）模型别名，Codex 系列同样支持 `plus-` / `team-` / `pro-` 前缀；`/v1/models`、在线画图与各图片接口同步支持，2.5 模型质量档新增 `xhigh`、`max`。
+
 ## 1.8.0 - 2026-07-28
 
 + [新增] 新增默认请求上游模型名称和默认思考强度配置，支持在设置页面修改，并可通过模型名的 `-standard`、`-extended`、`-max` 后缀覆盖思考强度。

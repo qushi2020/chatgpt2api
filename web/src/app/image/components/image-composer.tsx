@@ -62,6 +62,9 @@ const qualityOptions = [
   { value: "low", label: "低" },
   { value: "medium", label: "中" },
   { value: "high", label: "高" },
+  // xhigh / max 为 gpt-image-2.5 系列新增档位，仅 Codex 2.5 链路结构化生效
+  { value: "xhigh", label: "超高" },
+  { value: "max", label: "最高" },
 ];
 const aspectOptions = [
   { ratio: "1:1", tier: "1k", width: "1024", height: "1024", label: "1:1", icon: Square },
